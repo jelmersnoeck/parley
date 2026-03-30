@@ -16,16 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install swiftly
-        run: |
-          brew install swiftly
-          swiftly install latest
-
       - name: Build release binary
-        run: swiftly run swift build -c release
+        run: swift build -c release
 
       - name: Run tests
-        run: swiftly run swift test
+        run: swift test
 
       - name: Create .app bundle
         run: |

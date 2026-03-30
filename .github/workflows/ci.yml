@@ -12,13 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install swiftly
-        run: |
-          brew install swiftly
-          swiftly install latest
-
       - name: Build
-        run: swiftly run swift build
+        run: swift build
 
       - name: Test
-        run: swiftly run swift test
+        run: swift test
