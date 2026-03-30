@@ -11,11 +11,33 @@ actor GitHubClient {
 
     // MARK: - Token retrieval
 
+    /// Locate the `gh` binary. GUI apps launched from Finder/Dock don't inherit
+    /// the shell PATH, so /usr/bin/env can't find Homebrew binaries. We check
+    /// common install locations explicitly.
+    private static func findGH() -> URL? {
+        let candidates = [
+            "/opt/homebrew/bin/gh",   // Homebrew (Apple Silicon)
+            "/usr/local/bin/gh",      // Homebrew (Intel) / manual install
+            "/usr/bin/gh",            // unlikely but possible
+        ]
+        for path in candidates {
+            let url = URL(fileURLWithPath: path)
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return url
+            }
+        }
+        return nil
+    }
+
     static func tokenFromGH() async throws -> String {
+        guard let ghURL = findGH() else {
+            throw ClientError.ghCLINotAuthenticated
+        }
+
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["gh", "auth", "token"]
+        process.executableURL = ghURL
+        process.arguments = ["auth", "token"]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
 
