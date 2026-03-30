@@ -4,25 +4,7 @@ A macOS native app for reviewing GitHub PRs that contain markdown documents — 
 
 Renders the markdown beautifully, shows inline review comments anchored to specific lines, and supports the full GitHub PR review workflow: read comments, reply, stage draft comments, and submit a batched review.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  [PR URL input]              [Refresh] [Submit Review]  │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  # User Identifier Delegated Grant Access               │
-│  Author: Benjamin Boudreau                              │
-│                                                         │
-│  Allowing Application to retrieve the delegated...      │
-│  ┌─ 3 comments ───────────────────────────────┐         │
-│  │ @TroyBarnes: What's the Greendale ID?        │         │
-│  │ @AbedNadir: Yes, the student API ID.        │         │
-│  │ [Reply...]                                  │         │
-│  └─────────────────────────────────────────────┘         │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│  8 comments · 2 drafts · MERGED                         │
-└─────────────────────────────────────────────────────────┘
-```
+![Parley reviewing an RFC](parley.png)
 
 ## Requirements
 
