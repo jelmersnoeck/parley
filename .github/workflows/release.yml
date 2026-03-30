@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install swiftly
+        run: |
+          brew install swiftly
+          swiftly install latest
+
+      - name: Build release binary
+        run: swiftly run swift build -c release
+
+      - name: Run tests
+        run: swiftly run swift test
+
+      - name: Create .app bundle
+        run: |
+          VERSION="${TAG#v}"
+          app_dir="build/Parley.app/Contents"
+          mkdir -p "${app_dir}/MacOS"
+          mkdir -p "${app_dir}/Resources"
+          cp .build/arm64-apple-macosx/release/Parley "${app_dir}/MacOS/Parley"
+          cp -R .build/arm64-apple-macosx/release/Parley_Parley.bundle "${app_dir}/Resources/"
+          cp Sources/Parley/Resources/AppIcon.icns "${app_dir}/Resources/AppIcon.icns"
+          cat > "${app_dir}/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>Parley</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.parley.app</string>
+            <key>CFBundleName</key>
+            <string>Parley</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>14.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Zip .app bundle
+        run: cd build && zip -r Parley.app.zip Parley.app
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${TAG}" \
+            build/Parley.app.zip \
+            --title "Parley ${TAG}" \
+            --generate-notes
+
+  update-homebrew-tap:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Update Cask version in homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+
+          SHA=$(gh api repos/jelmersnoeck/homebrew-tap/contents/Casks/parley.rb \
+            --method GET --jq '.sha')
+
+          CONTENT=$(cat <<'CASK'
+          cask "parley" do
+            version "VERSION_PLACEHOLDER"
+            sha256 :no_check
+
+            url "https://github.com/jelmersnoeck/parley/releases/download/v#{version}/Parley.app.zip"
+            name "Parley"
+            desc "macOS native PR review app for markdown documents (KEPs, RFCs, ADRs)"
+            homepage "https://github.com/jelmersnoeck/parley"
+
+            depends_on macos: ">= :sonoma"
+            depends_on formula: "gh"
+
+            app "Parley.app"
+
+            zap trash: [
+              "~/Library/Preferences/com.parley.app.plist",
+            ]
+          end
+          CASK
+          )
+
+          CONTENT="${CONTENT//VERSION_PLACEHOLDER/${VERSION}}"
+          ENCODED=$(echo "${CONTENT}" | base64 -w 0)
+
+          gh api repos/jelmersnoeck/homebrew-tap/contents/Casks/parley.rb \
+            --method PUT \
+            --field message="chore: bump parley to ${VERSION}" \
+            --field content="${ENCODED}" \
+            --field sha="${SHA}"
