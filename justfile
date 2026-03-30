@@ -75,6 +75,12 @@ app: release
   PLIST
   echo "built build/Parley.app"
 
+# Install .app to /Applications
+install-app: app
+  rm -rf /Applications/Parley.app
+  cp -R build/Parley.app /Applications/Parley.app
+  @echo "installed /Applications/Parley.app"
+
 # Clean build artifacts
 clean:
   swiftly run swift package clean
