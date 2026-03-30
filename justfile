@@ -46,6 +46,7 @@ app: release
   mkdir -p "${app_dir}/Resources"
   cp .build/arm64-apple-macosx/release/Parley "${app_dir}/MacOS/Parley"
   cp -R .build/arm64-apple-macosx/release/Parley_Parley.bundle "${app_dir}/Resources/"
+  cp Sources/Parley/Resources/AppIcon.icns "${app_dir}/Resources/AppIcon.icns"
   cat > "${app_dir}/Info.plist" << 'PLIST'
   <?xml version="1.0" encoding="UTF-8"?>
   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -65,6 +66,8 @@ app: release
     <string>1.0.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>NSHighResolutionCapable</key>
     <true/>
   </dict>
