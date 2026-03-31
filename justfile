@@ -73,6 +73,7 @@ app: release
   </dict>
   </plist>
   PLIST
+  codesign --force --deep -s - build/Parley.app
   echo "built build/Parley.app"
 
 # Install .app to /Applications
