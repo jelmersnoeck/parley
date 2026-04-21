@@ -3,7 +3,9 @@ id: edit-staged-comments
 status: implemented
 ---
 <!-- Post-review hardening applied: input validation, dedup of empty-body logic,
-     O(1) draft lookups, CSS class visibility, extracted helpers. See commit. -->
+     O(1) draft lookups, CSS class visibility, extracted helpers.
+     Second review pass: structured logging, null-byte sanitization, CSS selector
+     escaping, Unicode-safe truncation, DraftEditView extraction, test coverage. -->
 # Edit staged draft comments before review submission
 
 ## Description
@@ -19,7 +21,7 @@ draft indicators.
 - `Sources/Parley/Resources/markdown-render.js` — renders `draft-indicator` divs (read-only today)
 - `Sources/Parley/Resources/styles.css` — draft indicator styles; added `.hidden` utility class
 - `Sources/Parley/GitHub/Models.swift` — `DraftComment` struct (unchanged)
-- `Tests/ParleyTests/PRViewModelTests.swift` — existing `updateDraft` test + 4 new tests
+- `Tests/ParleyTests/PRViewModelTests.swift` — existing `updateDraft` test + 6 new tests (empty body, non-existent UUID, preserve others, remove non-existent, same body no-op, long body truncation)
 
 ## Behavior
 
@@ -55,6 +57,13 @@ draft indicators.
 - JS validates draft IDs match UUID format (`/^[0-9a-f]{8}-…$/i`) before processing.
 - Maximum draft body length enforced on both JS (100,000 chars) and Swift (100,000 chars) sides.
 - DOM visibility toggling uses the `.hidden` CSS class, not inline `style.display`.
+- `maxBodyLength` is defined once in `PRViewModel` and referenced by coordinator and SwiftUI; JS has its own `MAX_BODY_LENGTH` constant (not yet injected from Swift, but values are synchronized).
+- All coordinator message handlers log warnings on invalid input via `os.Logger`.
+- CSS attribute selectors use `cssEscape()` to prevent selector injection from draft IDs.
+- Body text is sanitized (null bytes stripped) before processing in both JS and Swift.
+- UUID parsing is deduplicated into `parseUUID(from:label:)` helper in the coordinator.
+- JS `saveDraftEdit` delegates empty-body deletion to Swift (no client-side duplication).
+- InspectorPanel enforces `maxBodyLength` via `onChange` truncation in `DraftEditView`.
 
 ## Interfaces
 
@@ -72,16 +81,17 @@ draft indicators.
 
 ```swift
 case "editComment":
-    guard let idString = body["id"] as? String,
-          let uuid = UUID(uuidString: idString),
-          let newBody = body["body"] as? String else { return }
-    let truncated = String(newBody.prefix(Self.maxBodyLength))
-    viewModel.updateDraftComment(id: uuid, body: truncated)
+    guard let uuid = Self.parseUUID(from: body, label: "editComment") else { return }
+    guard let newBody = body["body"] as? String else {
+        Self.logger.warning("editComment: missing 'body' field")
+        return
+    }
+    let sanitized = Self.sanitizedBody(newBody)
+    viewModel.updateDraftComment(id: uuid, body: sanitized)
     reloadContent()
 
 case "removeComment":
-    guard let idString = body["id"] as? String,
-          let uuid = UUID(uuidString: idString) else { return }
+    guard let uuid = Self.parseUUID(from: body, label: "removeComment") else { return }
     viewModel.removeDraftComment(id: uuid)
     reloadContent()
 ```
@@ -117,15 +127,17 @@ struct DraftCommentRow: View {
 ### JS functions (new)
 
 ```javascript
-function editDraftComment(draftId)       // swap indicator -> edit box (validates UUID)
-function saveDraftEdit(draftId)          // post editComment to Swift (validates + truncates body)
-function cancelDraftEdit(draftId)        // restore indicator
-function removeDraftFromWebView(draftId) // post removeComment to Swift (validates UUID)
-function createEditBox(draftId, body)    // builds the edit box DOM subtree
+function editDraftComment(draftId)       // swap indicator -> edit box (validates UUID + context)
+function saveDraftEdit(draftId)          // post editComment to Swift (validates, sanitizes, Unicode-safe truncation)
+function cancelDraftEdit(draftId)        // restore indicator (UUID-validated, CSS-escaped selectors)
+function removeDraftFromWebView(draftId) // post removeComment to Swift (validates UUID, logs warnings)
+function createEditBox(draftId, body)    // builds the edit box DOM subtree (sanitizes body)
 function createEditActions(draftId)      // builds Save/Cancel button wrap
-function rebuildDraftIndex()             // rebuilds draftCommentsById Map for O(1) lookups
+function rebuildDraftIndex()             // rebuilds draftCommentsById Map (fingerprint-gated)
 function isValidUUID(str)                // UUID format validation
 function findDraftById(draftId)          // O(1) lookup via draftCommentsById
+function cssEscape(str)                  // escapes strings for CSS attribute selectors
+function sanitizeBodyText(str)           // strips null bytes from body text
 ```
 
 ## Edge Cases
