@@ -125,7 +125,8 @@ struct PRViewModelTests {
         let vm = PRViewModel()
         vm.addDraftComment(line: 10, body: "short", path: "doc.md")
         let id = vm.draftComments[0].id
-        let longBody = String(repeating: "A", count: 150_000)
+        // Boundary: exactly maxBodyLength + 1 to test truncation edge
+        let longBody = String(repeating: "A", count: PRViewModel.maxBodyLength + 1)
         let truncated = String(longBody.prefix(PRViewModel.maxBodyLength))
         vm.updateDraftComment(id: id, body: truncated)
         #expect(vm.draftComments[0].body.count == PRViewModel.maxBodyLength)

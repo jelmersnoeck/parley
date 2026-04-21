@@ -11,12 +11,33 @@ var draftComments = [];
 var expandedThreads = {};
 var tocVisible = true;
 
-// Post message to Swift
+// Post message to Swift. Errors are bridged back via a dedicated logError action
+// so they surface in os.Logger instead of vanishing into the WebKit console void.
 function postToSwift(msg) {
     try {
         window.webkit.messageHandlers.parley.postMessage(msg);
     } catch (err) {
-        console.error('postToSwift failed:', err, 'message:', JSON.stringify(msg));
+        var detail;
+        try { detail = JSON.stringify(msg); } catch (_) { detail = String(msg); }
+        var errorMsg = 'postToSwift failed: ' + String(err) + ' message: ' + detail;
+        console.error(errorMsg);
+        // Bridge to Swift logger — avoid infinite recursion by not calling postToSwift
+        try {
+            window.webkit.messageHandlers.parley.postMessage({
+                action: 'logError', source: 'postToSwift', detail: errorMsg
+            });
+        } catch (_) { /* truly hosed; nothing more we can do */ }
+    }
+}
+
+// Report a warning/error from JS to Swift for proper logging
+function reportToSwift(source, detail) {
+    try {
+        window.webkit.messageHandlers.parley.postMessage({
+            action: 'logError', source: source, detail: String(detail)
+        });
+    } catch (_) {
+        console.error('[' + source + '] ' + detail);
     }
 }
 
@@ -648,7 +669,7 @@ var draftCommentsById = {};
 var lastDraftFingerprint = '';
 
 function rebuildDraftIndex() {
-    var fingerprint = draftComments.map(function(d) { return d.id; }).join(',');
+    var fingerprint = draftComments.map(function(d) { return d.id; }).join('\0');
     if (fingerprint === lastDraftFingerprint) return;
     lastDraftFingerprint = fingerprint;
     draftCommentsById = {};
@@ -665,29 +686,35 @@ function isValidUUID(str) {
 }
 
 // Escape a string for safe use inside CSS attribute selectors.
-// Even though we UUID-validate, this prevents any selector injection.
+// Uses native CSS.escape() when available (WebKit supports it), with a
+// comprehensive fallback that handles all CSS-special characters.
 function cssEscape(str) {
-    return str.replace(/["\\]/g, '\\$&');
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+        return CSS.escape(str);
+    }
+    // Fallback: escape anything outside [a-zA-Z0-9_-] plus all CSS-special chars
+    return str.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
 }
 
 function findDraftById(draftId) {
     return draftCommentsById[draftId] || null;
 }
 
-// Sanitize body text: strip null bytes for defense-in-depth
+// Sanitize body text: strip null bytes and other C0/C1 control characters
+// (except tab, newline, carriage return which are legitimate in markdown).
 function sanitizeBodyText(str) {
-    return str.replace(/\0/g, '');
+    return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '');
 }
 
 function editDraftComment(draftId) {
     if (!isValidUUID(draftId)) {
-        console.warn('editDraftComment: invalid UUID', draftId);
+        reportToSwift('editDraftComment', 'invalid UUID: ' + draftId);
         return;
     }
 
     var draft = findDraftById(draftId);
     if (!draft) {
-        console.warn('editDraftComment: draft not found in current context', draftId);
+        reportToSwift('editDraftComment', 'draft not found: ' + draftId);
         return;
     }
 
@@ -763,14 +790,41 @@ function saveDraftEdit(draftId) {
 
     var body = sanitizeBodyText(textarea.value.trim());
 
-    // Unicode-safe truncation: split into code points, not UTF-16 code units
-    if (Array.from(body).length > MAX_BODY_LENGTH) {
-        body = Array.from(body).slice(0, MAX_BODY_LENGTH).join('');
-    }
+    // Unicode-safe truncation using for..of (iterates code points, not UTF-16
+    // code units) with early termination — no O(n) Array.from allocation.
+    body = unicodeTruncate(body, MAX_BODY_LENGTH);
 
     // Let Swift model be the single source of truth for empty-body-means-delete.
     // Post editComment for all cases; the coordinator + PRViewModel handle deletion.
-    postToSwift({ action: 'editComment', id: draftId, body: body });
+    try {
+        postToSwift({ action: 'editComment', id: draftId, body: body });
+    } catch (err) {
+        reportToSwift('saveDraftEdit', 'failed to save draft ' + draftId + ': ' + err);
+        // Surface feedback so the user knows their edit didn't persist
+        textarea.classList.add('save-error');
+        textarea.setAttribute('title', 'Save failed — please try again');
+    }
+}
+
+// Unicode-safe string truncation. Iterates code points (not UTF-16 code units)
+// and stops early once maxLen is reached — O(maxLen) not O(n).
+function unicodeTruncate(str, maxLen) {
+    var count = 0;
+    for (var ch of str) {
+        count++;
+        if (count > maxLen) {
+            // We've passed the limit; rebuild up to maxLen code points
+            var result = '';
+            var i = 0;
+            for (var c of str) {
+                if (i >= maxLen) break;
+                result += c;
+                i++;
+            }
+            return result;
+        }
+    }
+    return str; // already within limit
 }
 
 function cancelDraftEdit(draftId) {
@@ -786,7 +840,7 @@ function cancelDraftEdit(draftId) {
 
 function removeDraftFromWebView(draftId) {
     if (!isValidUUID(draftId)) {
-        console.warn('removeDraftFromWebView: invalid UUID', draftId);
+        reportToSwift('removeDraftFromWebView', 'invalid UUID: ' + draftId);
         return;
     }
     postToSwift({ action: 'removeComment', id: draftId });

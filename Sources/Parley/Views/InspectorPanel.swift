@@ -150,6 +150,14 @@ private struct DraftEditView: View {
                     return .handled
                 }
                 .onChange(of: editText) { _, newValue in
+                    // Quick byte-length check first (O(1) on Swift strings) to avoid
+                    // expensive O(n) Character count on every keystroke.
+                    // Each Character is at least 1 byte, so if utf8.count is within
+                    // limit, Character count must also be within limit.
+                    guard newValue.utf8.count > PRViewModel.maxBodyLength else { return }
+                    // Only now do the real Character count + truncation.
+                    // String.prefix operates on Character (grapheme cluster) boundaries
+                    // so this never splits multi-byte sequences.
                     if newValue.count > PRViewModel.maxBodyLength {
                         editText = String(newValue.prefix(PRViewModel.maxBodyLength))
                     }

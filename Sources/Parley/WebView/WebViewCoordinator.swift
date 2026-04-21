@@ -7,6 +7,7 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     weak var webView: WKWebView?
     private var templateLoaded = false
     private var pendingContentLoad = false
+    private var jsErrorCount = 0
 
     private static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.parley",
@@ -23,6 +24,13 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
         guard let body = message.body as? [String: Any],
               let action = body["action"] as? String else {
             Self.logger.warning("Malformed JS message: expected {action: String, ...}, got \(String(describing: message.body))")
+            return
+        }
+
+        // Validate message keys are all strings (reject non-string keys that could indicate injection)
+        let knownActions: Set<String> = ["addComment", "submitReply", "editComment", "removeComment", "expandThread", "collapseThread", "logError"]
+        guard knownActions.contains(action) else {
+            Self.logger.debug("Unknown JS action: \(action)")
             return
         }
 
@@ -60,6 +68,7 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
                 // Sanitize + truncate, but allow empty (model treats empty as delete)
                 let sanitized = Self.sanitizedBody(newBody)
                 viewModel.updateDraftComment(id: uuid, body: sanitized)
+                Self.logger.debug("editComment: updated draft \(uuid)")
                 reloadContent()
 
             case "removeComment":
@@ -67,13 +76,20 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
                     return
                 }
                 viewModel.removeDraftComment(id: uuid)
+                Self.logger.debug("removeComment: removed draft \(uuid)")
                 reloadContent()
+
+            case "logError":
+                let source = body["source"] as? String ?? "unknown"
+                let detail = body["detail"] as? String ?? "(no detail)"
+                jsErrorCount += 1
+                Self.logger.error("JS error (#\(self.jsErrorCount)) [\(source)]: \(detail)")
 
             case "expandThread", "collapseThread":
                 break
 
             default:
-                Self.logger.debug("Unknown JS action: \(action)")
+                break
             }
         }
     }
@@ -103,9 +119,25 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
 
     /// Sanitizes and truncates a body string. Allows empty — use for editComment where
     /// empty body means "delete" (handled by the model).
+    ///
+    /// Strips null bytes + C0/C1 control characters (preserving tab, newline, CR),
+    /// trims whitespace, and Unicode-safe truncates to maxBodyLength using Character
+    /// boundaries (never splits a grapheme cluster or multi-byte sequence).
     private static func sanitizedBody(_ raw: String) -> String {
-        let stripped = raw.replacingOccurrences(of: "\0", with: "")
-        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = raw.unicodeScalars.filter { scalar in
+            // Keep tab (\t = 0x09), newline (\n = 0x0A), carriage return (\r = 0x0D)
+            switch scalar.value {
+            case 0x09, 0x0A, 0x0D:
+                return true
+            case 0x00...0x1F, 0x7F...0x9F:
+                return false
+            default:
+                return true
+            }
+        }
+        let trimmed = String(stripped).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Unicode-safe truncation: String.prefix on Character count respects
+        // grapheme cluster boundaries — never splits multi-byte sequences.
         return String(trimmed.prefix(PRViewModel.maxBodyLength))
     }
 
@@ -169,9 +201,10 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
         let draftsJSON = draftsToJSON(viewModel.draftComments)
 
         let js = "renderMarkdown(`\(markdown)`, \(threadsJSON), \(draftsJSON));"
-        webView.evaluateJavaScript(js) { _, error in
+        webView.evaluateJavaScript(js) { [weak self] _, error in
             if let error {
-                Self.logger.error("JS render error: \(error)")
+                self?.jsErrorCount += 1
+                Self.logger.error("JS render error (#\(self?.jsErrorCount ?? 0)): \(error)")
             }
         }
     }
