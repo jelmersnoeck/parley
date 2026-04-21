@@ -25,6 +25,7 @@ function sanitize(html) {
 function renderMarkdown(markdown, threads, drafts) {
     commentThreads = threads || [];
     draftComments = drafts || [];
+    rebuildDraftIndex();
 
     // Strip and render frontmatter
     var content = markdown;
@@ -638,23 +639,49 @@ function getLineBlockText(startLine, endLine) {
 //  │ [Save]  [Cancel]         │
 //  └──────────────────────────┘
 
+// O(1) draft lookup by ID (rebuilt on each render)
+var draftCommentsById = {};
+
+function rebuildDraftIndex() {
+    draftCommentsById = {};
+    for (var i = 0; i < draftComments.length; i++) {
+        draftCommentsById[draftComments[i].id] = draftComments[i];
+    }
+}
+
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var MAX_BODY_LENGTH = 100000;
+
+function isValidUUID(str) {
+    return typeof str === 'string' && UUID_RE.test(str);
+}
+
+function findDraftById(draftId) {
+    return draftCommentsById[draftId] || null;
+}
+
 function editDraftComment(draftId) {
-    // Edge case 6: prevent double-click from creating duplicate edit boxes
+    if (!isValidUUID(draftId)) return;
+
+    // Prevent double-click from creating duplicate edit boxes
     if (document.querySelector('.draft-edit-box[data-draft-id="' + draftId + '"]')) return;
 
     var indicator = document.querySelector('.draft-indicator[data-draft-id="' + draftId + '"]');
     if (!indicator) return;
 
-    // Find the draft body from the stored draftComments array
-    var draft = null;
-    for (var i = 0; i < draftComments.length; i++) {
-        if (draftComments[i].id === draftId) { draft = draftComments[i]; break; }
-    }
+    var draft = findDraftById(draftId);
     if (!draft) return;
 
-    // Hide the indicator
-    indicator.style.display = 'none';
+    indicator.classList.add('hidden');
 
+    var editBox = createEditBox(draftId, draft.body);
+    indicator.parentNode.insertBefore(editBox, indicator.nextSibling);
+
+    var textarea = document.getElementById('draft-edit-' + draftId);
+    if (textarea) setTimeout(function() { textarea.focus(); }, 50);
+}
+
+function createEditBox(draftId, body) {
     var editBox = document.createElement('div');
     editBox.className = 'draft-edit-box';
     editBox.setAttribute('data-draft-id', draftId);
@@ -667,9 +694,16 @@ function editDraftComment(draftId) {
 
     var textarea = document.createElement('textarea');
     textarea.id = textareaId;
-    textarea.value = draft.body;
+    textarea.value = body;
     replyBox.appendChild(textarea);
 
+    replyBox.appendChild(createEditActions(draftId));
+    editBox.appendChild(replyBox);
+
+    return editBox;
+}
+
+function createEditActions(draftId) {
     var btnWrap = document.createElement('div');
     btnWrap.className = 'draft-edit-actions';
 
@@ -691,19 +725,21 @@ function editDraftComment(draftId) {
     });
     btnWrap.appendChild(cancelBtn);
 
-    replyBox.appendChild(btnWrap);
-    editBox.appendChild(replyBox);
-
-    indicator.parentNode.insertBefore(editBox, indicator.nextSibling);
-    setTimeout(function() { textarea.focus(); }, 50);
+    return btnWrap;
 }
 
 function saveDraftEdit(draftId) {
+    if (!isValidUUID(draftId)) return;
+
     var textarea = document.getElementById('draft-edit-' + draftId);
     if (!textarea) return;
 
     var body = textarea.value.trim();
-    // Edge case 2: empty body -> remove the draft
+    if (body.length > MAX_BODY_LENGTH) {
+        body = body.substring(0, MAX_BODY_LENGTH);
+    }
+
+    // Empty body -> remove the draft (consistent with Swift model behavior)
     if (!body) {
         removeDraftFromWebView(draftId);
         return;
@@ -717,10 +753,11 @@ function cancelDraftEdit(draftId) {
     if (editBox) editBox.remove();
 
     var indicator = document.querySelector('.draft-indicator[data-draft-id="' + draftId + '"]');
-    if (indicator) indicator.style.display = '';
+    if (indicator) indicator.classList.remove('hidden');
 }
 
 function removeDraftFromWebView(draftId) {
+    if (!isValidUUID(draftId)) return;
     postToSwift({ action: 'removeComment', id: draftId });
 }
 

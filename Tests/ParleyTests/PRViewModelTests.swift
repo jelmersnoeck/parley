@@ -71,10 +71,8 @@ struct PRViewModelTests {
         vm.addDraftComment(line: 10, body: "Troy Barnes was here", path: "doc.md")
         let id = vm.draftComments[0].id
         vm.updateDraftComment(id: id, body: "   \n  ")
-        // Empty body should NOT remove — that logic lives in the coordinator/UI layer
-        // The model method just updates the body
-        #expect(vm.draftComments.count == 1)
-        #expect(vm.draftComments[0].body == "   \n  ")
+        // Empty/whitespace body triggers deletion — single source of truth in the model
+        #expect(vm.draftComments.isEmpty)
     }
 
     @Test("update non-existent UUID is a no-op")

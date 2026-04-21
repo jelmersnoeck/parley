@@ -36,9 +36,17 @@ final class PRViewModel {
         draftComments.removeAll { $0.id == id }
     }
 
+    /// Updates a draft comment's body. Empty/whitespace-only body removes the draft.
+    ///
+    /// This is the single source of truth for "empty means delete" logic — callers
+    /// (coordinator, inspector panel, JS) should NOT duplicate this check.
     func updateDraftComment(id: UUID, body: String) {
         guard let index = draftComments.firstIndex(where: { $0.id == id }) else { return }
-        draftComments[index].body = body
+        if body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draftComments.remove(at: index)
+        } else {
+            draftComments[index].body = body
+        }
     }
 
     func clearDrafts() {

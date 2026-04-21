@@ -7,6 +7,9 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     private var templateLoaded = false
     private var pendingContentLoad = false
 
+    /// Maximum allowed length for a draft comment body from JS input.
+    private static let maxBodyLength = 100_000
+
     init(viewModel: PRViewModel) {
         self.viewModel = viewModel
     }
@@ -21,26 +24,25 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             switch action {
             case "addComment":
                 guard let line = body["line"] as? Int,
-                      let commentBody = body["body"] as? String else { return }
+                      let commentBody = body["body"] as? String,
+                      let validated = Self.validatedBody(commentBody) else { return }
                 let startLine = body["startLine"] as? Int
                 let path = viewModel.prMetadata?.markdownFilePath ?? ""
-                viewModel.addDraftComment(line: line, startLine: startLine, body: commentBody, path: path)
+                viewModel.addDraftComment(line: line, startLine: startLine, body: validated, path: path)
                 reloadContent()
 
             case "submitReply":
                 guard let commentId = body["commentId"] as? Int,
-                      let replyBody = body["body"] as? String else { return }
-                await viewModel.replyToThread(commentId: commentId, body: replyBody)
+                      let replyBody = body["body"] as? String,
+                      let validated = Self.validatedBody(replyBody) else { return }
+                await viewModel.replyToThread(commentId: commentId, body: validated)
 
             case "editComment":
                 guard let idString = body["id"] as? String,
                       let uuid = UUID(uuidString: idString),
                       let newBody = body["body"] as? String else { return }
-                if newBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    viewModel.removeDraftComment(id: uuid)
-                } else {
-                    viewModel.updateDraftComment(id: uuid, body: newBody)
-                }
+                let truncated = String(newBody.prefix(Self.maxBodyLength))
+                viewModel.updateDraftComment(id: uuid, body: truncated)
                 reloadContent()
 
             case "removeComment":
@@ -56,6 +58,15 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
                 break
             }
         }
+    }
+
+    // MARK: - Input validation
+
+    /// Validates and truncates a body string from JS. Returns nil if empty after trimming.
+    private static func validatedBody(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(maxBodyLength))
     }
 
     // MARK: - WKNavigationDelegate

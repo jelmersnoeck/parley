@@ -45,13 +45,7 @@ struct InspectorPanel: View {
                         }, onRemove: {
                             viewModel.removeDraftComment(id: draft.id)
                         }, onSave: { newBody in
-                            let trimmed = newBody.trimmingCharacters(in: .whitespacesAndNewlines)
-                            switch trimmed.isEmpty {
-                            case true:
-                                viewModel.removeDraftComment(id: draft.id)
-                            case false:
-                                viewModel.updateDraftComment(id: draft.id, body: newBody)
-                            }
+                            viewModel.updateDraftComment(id: draft.id, body: newBody)
                         })
                     }
                 }
@@ -112,35 +106,9 @@ struct DraftCommentRow: View {
                 .buttonStyle(.plain)
             }
 
-            switch isEditing {
-            case true:
-                TextEditor(text: $editText)
-                    .font(.caption)
-                    .frame(minHeight: 40, maxHeight: 120)
-                    .padding(4)
-                    .background(.quaternary)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .onKeyPress(.escape) {
-                        isEditing = false
-                        return .handled
-                    }
-
-                HStack(spacing: 8) {
-                    Button("Save") {
-                        onSave(editText)
-                        isEditing = false
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .controlSize(.small)
-
-                    Button("Cancel") {
-                        isEditing = false
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            case false:
+            if isEditing {
+                editingView
+            } else {
                 Text(draft.body)
                     .font(.caption)
                     .lineLimit(3)
@@ -151,6 +119,37 @@ struct DraftCommentRow: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
+    }
+
+    private var editingView: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            TextEditor(text: $editText)
+                .font(.caption)
+                .frame(minHeight: 40, maxHeight: 120)
+                .padding(4)
+                .background(.quaternary)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .onKeyPress(.escape) {
+                    isEditing = false
+                    return .handled
+                }
+
+            HStack(spacing: 8) {
+                Button("Save") {
+                    onSave(editText)
+                    isEditing = false
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+                .controlSize(.small)
+
+                Button("Cancel") {
+                    isEditing = false
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
     }
 }
 
