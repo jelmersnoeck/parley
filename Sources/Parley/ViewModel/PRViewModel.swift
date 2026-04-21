@@ -4,6 +4,9 @@ import SwiftUI
 @Observable
 @MainActor
 final class PRViewModel {
+    /// Maximum allowed length for a draft comment body. Shared with JS via coordinator injection.
+    static let maxBodyLength = 100_000
+
     // MARK: - State
 
     var urlInput: String = ""
@@ -27,7 +30,14 @@ final class PRViewModel {
 
     // MARK: - Draft management
 
+    /// Adds a draft comment at the given line. Validates that `line` is positive
+    /// and within `WebViewCoordinator.maxLineNumber` to prevent logic bugs from
+    /// user-controlled data flowing through unchecked.
     func addDraftComment(line: Int, startLine: Int? = nil, body: String, path: String) {
+        guard line > 0, line <= WebViewCoordinator.maxLineNumber else { return }
+        if let sl = startLine {
+            guard sl > 0, sl <= WebViewCoordinator.maxLineNumber, sl <= line else { return }
+        }
         let draft = DraftComment(line: line, startLine: startLine, body: body, path: path)
         draftComments.append(draft)
     }
@@ -36,9 +46,21 @@ final class PRViewModel {
         draftComments.removeAll { $0.id == id }
     }
 
+    /// Updates a draft comment's body. Empty/whitespace-only body removes the draft.
+    /// Truncates to `maxBodyLength` Characters as defense in depth (callers should
+    /// also enforce limits, but the model is the final backstop).
+    ///
+    /// This is the single source of truth for "empty means delete" logic — callers
+    /// (coordinator, inspector panel, JS) should NOT duplicate this check.
     func updateDraftComment(id: UUID, body: String) {
         guard let index = draftComments.firstIndex(where: { $0.id == id }) else { return }
-        draftComments[index].body = body
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed.isEmpty {
+        case true:
+            draftComments.remove(at: index)
+        case false:
+            draftComments[index].body = String(trimmed.prefix(Self.maxBodyLength))
+        }
     }
 
     func clearDrafts() {
