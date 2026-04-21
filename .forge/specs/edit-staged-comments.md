@@ -8,7 +8,10 @@ status: implemented
      escaping, Unicode-safe truncation, DraftEditView extraction, test coverage.
      Third review pass: comprehensive CSS.escape(), JS→Swift error bridging,
      C0/C1 control char stripping, O(maxLen) unicodeTruncate, save error UX,
-     known-action allowlist, jsErrorCount metrics, utf8 fast-path in onChange. -->
+     known-action allowlist, jsErrorCount metrics, utf8 fast-path in onChange.
+     Fourth review pass (code-review-hardening): structured log sanitization,
+     jsErrorCount exposed as metric, validation reordering, sanitization monitoring,
+     save-error retry button, paste-event defense, fingerprint separator fix. -->
 # Edit staged draft comments before review submission
 
 ## Description
@@ -63,7 +66,7 @@ draft indicators.
 - `maxBodyLength` is defined once in `PRViewModel` and referenced by coordinator and SwiftUI; JS has its own `MAX_BODY_LENGTH` constant (not yet injected from Swift, but values are synchronized).
 - All coordinator message handlers log warnings on invalid input via `os.Logger`.
 - CSS attribute selectors use `CSS.escape()` natively (with comprehensive fallback) to prevent selector injection from draft IDs.
-- Body text is sanitized (null bytes + C0/C1 control chars stripped, preserving tab/newline/CR) before processing in both JS and Swift.
+- Body text is sanitized (null bytes + C0/C1 control chars stripped, preserving tab/newline) before processing in both JS and Swift. Sanitization events are logged for production monitoring.
 - JS errors are bridged to Swift via a `logError` message action for production visibility; `console.warn` is not relied upon.
 - The coordinator validates incoming actions against a known-action allowlist before processing.
 - JS `saveDraftEdit` handles postToSwift failures with user-visible feedback (CSS class + title attribute).

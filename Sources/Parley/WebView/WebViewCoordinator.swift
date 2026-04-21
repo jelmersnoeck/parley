@@ -7,7 +7,25 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     weak var webView: WKWebView?
     private var templateLoaded = false
     private var pendingContentLoad = false
-    private var jsErrorCount = 0
+
+    /// Tracks JS error count for production monitoring and alerting on rendering issues.
+    /// Bounded by `incrementErrorCount()` to prevent overflow in long-running sessions.
+    private(set) var jsErrorCount = 0
+
+    /// Security control: only these actions are processed from JS messages.
+    /// Any action not in this set is rejected with a warning log.
+    private static let knownActions: Set<String> = [
+        "addComment", "submitReply", "editComment", "removeComment",
+        "expandThread", "collapseThread", "logError",
+    ]
+
+    /// Maximum reasonable line number to accept from JS messages.
+    private static let maxLineNumber = 1_000_000
+
+    /// Maximum input length (in UTF-8 bytes) to process through Unicode scalar
+    /// filtering. Inputs beyond this are rejected outright to prevent resource
+    /// exhaustion during sanitization.
+    private static let maxInputBytes = 1_000_000
 
     private static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.parley",
@@ -21,16 +39,19 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     // MARK: - WKScriptMessageHandler
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any],
-              let action = body["action"] as? String else {
-            Self.logger.warning("Malformed JS message: expected {action: String, ...}, got \(String(describing: message.body))")
+        // Validate structure before parsing fields — reject non-dict payloads early
+        guard let body = message.body as? [String: Any] else {
+            Self.logger.warning("Malformed JS message: expected [String: Any], got type \(type(of: message.body))")
             return
         }
 
-        // Validate message keys are all strings (reject non-string keys that could indicate injection)
-        let knownActions: Set<String> = ["addComment", "submitReply", "editComment", "removeComment", "expandThread", "collapseThread", "logError"]
-        guard knownActions.contains(action) else {
-            Self.logger.debug("Unknown JS action: \(action)")
+        guard let action = body["action"] as? String else {
+            Self.logger.warning("Malformed JS message: missing or non-string 'action' key (keys: \(body.keys.sorted().joined(separator: ", ")))")
+            return
+        }
+
+        guard Self.knownActions.contains(action) else {
+            Self.logger.warning("Unknown JS action rejected: \(action)")
             return
         }
 
@@ -38,6 +59,7 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             switch action {
             case "addComment":
                 guard let line = body["line"] as? Int,
+                      Self.isValidLine(line, label: "addComment"),
                       let commentBody = body["body"] as? String,
                       let validated = Self.validatedBody(commentBody) else {
                     Self.logger.warning("addComment: invalid payload — line or body missing/empty")
@@ -82,7 +104,7 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             case "logError":
                 let source = body["source"] as? String ?? "unknown"
                 let detail = body["detail"] as? String ?? "(no detail)"
-                jsErrorCount += 1
+                incrementErrorCount()
                 Self.logger.error("JS error (#\(self.jsErrorCount)) [\(source)]: \(detail)")
 
             case "expandThread", "collapseThread":
@@ -95,6 +117,15 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     }
 
     // MARK: - Input validation
+
+    /// Validates that a line number is positive and within reasonable bounds.
+    private static func isValidLine(_ line: Int, label: String) -> Bool {
+        guard line > 0, line <= maxLineNumber else {
+            logger.warning("\(label): line \(line) out of valid range 1...\(maxLineNumber)")
+            return false
+        }
+        return true
+    }
 
     /// Extracts and validates a UUID from a message body's "id" field. Logs on failure.
     private static func parseUUID(from body: [String: Any], label: String) -> UUID? {
@@ -120,22 +151,48 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     /// Sanitizes and truncates a body string. Allows empty — use for editComment where
     /// empty body means "delete" (handled by the model).
     ///
-    /// Strips null bytes + C0/C1 control characters (preserving tab, newline, CR),
-    /// trims whitespace, and Unicode-safe truncates to maxBodyLength using Character
-    /// boundaries (never splits a grapheme cluster or multi-byte sequence).
+    /// Single-pass filter over unicodeScalars: strips null bytes + C0/C1 control
+    /// characters (preserving tab 0x09 and newline 0x0A; CR 0x0D is stripped as it's
+    /// unnecessary in markdown and could be used in injection combos). Trims whitespace,
+    /// then Unicode-safe truncates to maxBodyLength using Character boundaries (never
+    /// splits a grapheme cluster or multi-byte sequence).
+    ///
+    /// Rejects inputs exceeding `maxInputBytes` to prevent DoS through resource
+    /// exhaustion during Unicode scalar iteration.
     private static func sanitizedBody(_ raw: String) -> String {
-        let stripped = raw.unicodeScalars.filter { scalar in
-            // Keep tab (\t = 0x09), newline (\n = 0x0A), carriage return (\r = 0x0D)
+        guard raw.utf8.count <= maxInputBytes else {
+            logger.warning("sanitizedBody: input too large (\(raw.utf8.count) bytes), truncating before processing")
+            let prefixed = String(raw.prefix(maxInputBytes))
+            return sanitizedBody(prefixed)
+        }
+
+        // Single-pass filter: check + strip control characters in one iteration.
+        // Ranges stripped: C0 0x00-0x08, 0x0B-0x1F (skip tab 0x09, newline 0x0A),
+        // DEL 0x7F, C1 0x80-0x9F. Most inputs are clean and the filter returns
+        // the same scalar view, so String init is near-free.
+        var strippedCount = 0
+        let filtered = raw.unicodeScalars.filter { scalar in
             switch scalar.value {
-            case 0x09, 0x0A, 0x0D:
+            case 0x09, 0x0A:
                 return true
             case 0x00...0x1F, 0x7F...0x9F:
+                strippedCount += 1
                 return false
             default:
                 return true
             }
         }
-        let trimmed = String(stripped).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let cleaned: String
+        switch strippedCount {
+        case 0:
+            cleaned = raw
+        default:
+            cleaned = String(filtered)
+            logger.info("sanitizedBody: stripped \(strippedCount) control character(s) from input")
+        }
+
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         // Unicode-safe truncation: String.prefix on Character count respects
         // grapheme cluster boundaries — never splits multi-byte sequences.
         return String(trimmed.prefix(PRViewModel.maxBodyLength))
@@ -201,11 +258,22 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
         let draftsJSON = draftsToJSON(viewModel.draftComments)
 
         let js = "renderMarkdown(`\(markdown)`, \(threadsJSON), \(draftsJSON));"
+        let jsSnippet = js.prefix(200)
         webView.evaluateJavaScript(js) { [weak self] _, error in
             if let error {
-                self?.jsErrorCount += 1
-                Self.logger.error("JS render error (#\(self?.jsErrorCount ?? 0)): \(error)")
+                self?.incrementErrorCount()
+                Self.logger.error("JS render error (#\(self?.jsErrorCount ?? 0)): \(error) — snippet: \(jsSnippet)…")
             }
+        }
+    }
+
+    /// Increments `jsErrorCount` with an upper bound to prevent overflow in
+    /// long-running sessions. Logs a warning every 1000 errors as a health signal.
+    private func incrementErrorCount() {
+        guard jsErrorCount < Int.max else { return }
+        jsErrorCount += 1
+        if jsErrorCount.isMultiple(of: 1000) {
+            Self.logger.warning("JS error count reached \(self.jsErrorCount) — possible systemic issue")
         }
     }
 

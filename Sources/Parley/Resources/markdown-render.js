@@ -13,31 +13,52 @@ var tocVisible = true;
 
 // Post message to Swift. Errors are bridged back via a dedicated logError action
 // so they surface in os.Logger instead of vanishing into the WebKit console void.
+//
+// Failure handling: if the error report itself fails, we log to console and stop.
+// A counter caps error-reporting attempts to prevent infinite retry loops (e.g. if
+// the message handler is permanently broken).
+var _postToSwiftErrorAttempts = 0;
+var _postToSwiftMaxAttempts = 3;
+
 function postToSwift(msg) {
     try {
         window.webkit.messageHandlers.parley.postMessage(msg);
+        _postToSwiftErrorAttempts = 0; // reset on success
     } catch (err) {
-        var detail;
-        try { detail = JSON.stringify(msg); } catch (_) { detail = String(msg); }
-        var errorMsg = 'postToSwift failed: ' + String(err) + ' message: ' + detail;
+        // Avoid leaking user data in error logs — only include the action name
+        var actionName = (msg && typeof msg === 'object') ? String(msg.action || 'unknown') : 'unknown';
+        var errorMsg = 'postToSwift failed for action "' + actionName + '": ' + String(err);
         console.error(errorMsg);
-        // Bridge to Swift logger — avoid infinite recursion by not calling postToSwift
-        try {
-            window.webkit.messageHandlers.parley.postMessage({
-                action: 'logError', source: 'postToSwift', detail: errorMsg
-            });
-        } catch (_) { /* truly hosed; nothing more we can do */ }
+        // Bridge to Swift logger — capped attempts prevent infinite retry loops
+        if (_postToSwiftErrorAttempts < _postToSwiftMaxAttempts) {
+            _postToSwiftErrorAttempts++;
+            try {
+                window.webkit.messageHandlers.parley.postMessage({
+                    action: 'logError', source: 'postToSwift', detail: errorMsg
+                });
+            } catch (reportErr) {
+                // Error reporting itself failed — log to console as last resort
+                console.error('postToSwift: error reporting also failed (' +
+                    _postToSwiftErrorAttempts + '/' + _postToSwiftMaxAttempts + '): ' +
+                    String(reportErr));
+            }
+        }
     }
 }
 
-// Report a warning/error from JS to Swift for proper logging
+// Report a warning/error from JS to Swift for proper logging.
+// Failed reports fall back to console.warn (not silently swallowed).
+var _reportFailCount = 0;
+
 function reportToSwift(source, detail) {
     try {
         window.webkit.messageHandlers.parley.postMessage({
             action: 'logError', source: source, detail: String(detail)
         });
-    } catch (_) {
-        console.error('[' + source + '] ' + detail);
+        _reportFailCount = 0;
+    } catch (err) {
+        _reportFailCount++;
+        console.warn('[' + source + '] ' + detail + ' (report failed #' + _reportFailCount + ': ' + err + ')');
     }
 }
 
@@ -669,7 +690,8 @@ var draftCommentsById = {};
 var lastDraftFingerprint = '';
 
 function rebuildDraftIndex() {
-    var fingerprint = draftComments.map(function(d) { return d.id; }).join('\0');
+    // Pipe separator: can't appear in UUIDs, avoids null-byte collision risk
+    var fingerprint = draftComments.map(function(d) { return d.id; }).join('|');
     if (fingerprint === lastDraftFingerprint) return;
     lastDraftFingerprint = fingerprint;
     draftCommentsById = {};
@@ -687,23 +709,89 @@ function isValidUUID(str) {
 
 // Escape a string for safe use inside CSS attribute selectors.
 // Uses native CSS.escape() when available (WebKit supports it), with a
-// comprehensive fallback that handles all CSS-special characters.
+// comprehensive fallback per the CSS.escape() spec (CSSWG).
+//
+// Character handling per https://drafts.csswg.org/cssom/#serialize-an-identifier:
+//   U+0000           -> U+FFFD (replacement character)
+//   U+0001..U+001F   -> hex escape + space  (C0 control chars)
+//   U+007F           -> hex escape + space  (DEL)
+//   Leading digit     -> hex escape + space  (0-9 at position 0)
+//   Lone hyphen       -> backslash escape    (single "-")
+//   Hyphen+digit      -> hex escape + space  (digit at position 1 after "-")
+//   A-Z, a-z, 0-9,
+//   hyphen, underscore,
+//   U+0080+           -> pass through        (safe ident chars)
+//   Everything else   -> backslash escape    (punctuation, symbols, etc.)
 function cssEscape(str) {
     if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
         return CSS.escape(str);
     }
-    // Fallback: escape anything outside [a-zA-Z0-9_-] plus all CSS-special chars
-    return str.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+    var result = '';
+    for (var i = 0; i < str.length; i++) {
+        var ch = str.charCodeAt(i);
+        if (ch === 0x0000) {
+            result += '\uFFFD';
+            continue;
+        }
+        if ((ch >= 0x0001 && ch <= 0x001F) || ch === 0x007F) {
+            result += '\\' + ch.toString(16) + ' ';
+            continue;
+        }
+        if (i === 0) {
+            if (ch >= 0x0030 && ch <= 0x0039) {
+                result += '\\' + ch.toString(16) + ' ';
+                continue;
+            }
+            if (ch === 0x002D && str.length === 1) {
+                result += '\\' + str.charAt(i);
+                continue;
+            }
+        }
+        if (i === 1 && str.charCodeAt(0) === 0x002D && ch >= 0x0030 && ch <= 0x0039) {
+            result += '\\' + ch.toString(16) + ' ';
+            continue;
+        }
+        if (ch >= 0x0080 || ch === 0x002D || ch === 0x005F ||
+            (ch >= 0x0030 && ch <= 0x0039) || (ch >= 0x0041 && ch <= 0x005A) ||
+            (ch >= 0x0061 && ch <= 0x007A)) {
+            result += str.charAt(i);
+            continue;
+        }
+        result += '\\' + str.charAt(i);
+    }
+    return result;
 }
 
 function findDraftById(draftId) {
     return draftCommentsById[draftId] || null;
 }
 
-// Sanitize body text: strip null bytes and other C0/C1 control characters
-// (except tab, newline, carriage return which are legitimate in markdown).
+// Sanitize body text: strip control characters using a blocklist approach.
+// Allowed: tab (0x09) and newline (0x0A) — legitimate in markdown.
+// Stripped ranges (mirrors Swift sanitizedBody):
+//   0x00-0x08  C0 control chars before tab
+//   0x0B-0x1F  C0 control chars after newline (includes CR 0x0D)
+//   0x7F-0x9F  DEL + C1 control chars
+// CR (0x0D) is stripped — unnecessary in markdown, potential injection vector.
+// Logs to Swift when sanitization strips characters, for monitoring.
 function sanitizeBodyText(str) {
-    return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '');
+    var cleaned = str.replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/g, '');
+    if (cleaned.length !== str.length) {
+        var strippedCount = str.length - cleaned.length;
+        reportToSwift('sanitizeBodyText', 'stripped ' + strippedCount + ' control character(s) from input');
+    }
+    return cleaned;
+}
+
+// Find a DOM element by class name and data-draft-id using dataset comparison.
+// Avoids CSS selector construction (and cssEscape edge cases) by comparing
+// the raw dataset.draftId property via strict equality.
+function findByDraftId(className, draftId) {
+    var candidates = document.querySelectorAll('.' + className);
+    for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i].dataset.draftId === draftId) return candidates[i];
+    }
+    return null;
 }
 
 function editDraftComment(draftId) {
@@ -718,12 +806,10 @@ function editDraftComment(draftId) {
         return;
     }
 
-    var escaped = cssEscape(draftId);
-
     // Prevent double-click from creating duplicate edit boxes
-    if (document.querySelector('.draft-edit-box[data-draft-id="' + escaped + '"]')) return;
+    if (findByDraftId('draft-edit-box', draftId)) return;
 
-    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + escaped + '"]');
+    var indicator = findByDraftId('draft-indicator', draftId);
     if (!indicator) return;
 
     indicator.classList.add('hidden');
@@ -749,6 +835,10 @@ function createEditBox(draftId, body) {
     var textarea = document.createElement('textarea');
     textarea.id = textareaId;
     textarea.value = sanitizeBodyText(body);
+    // Clear stale error styling when user starts typing again
+    textarea.addEventListener('input', function() {
+        clearSaveError(draftId);
+    });
     replyBox.appendChild(textarea);
 
     replyBox.appendChild(createEditActions(draftId));
@@ -794,47 +884,79 @@ function saveDraftEdit(draftId) {
     // code units) with early termination — no O(n) Array.from allocation.
     body = unicodeTruncate(body, MAX_BODY_LENGTH);
 
+    // Clear any stale error state from a previous failed save
+    clearSaveError(draftId);
+
     // Let Swift model be the single source of truth for empty-body-means-delete.
     // Post editComment for all cases; the coordinator + PRViewModel handle deletion.
     try {
         postToSwift({ action: 'editComment', id: draftId, body: body });
     } catch (err) {
         reportToSwift('saveDraftEdit', 'failed to save draft ' + draftId + ': ' + err);
-        // Surface feedback so the user knows their edit didn't persist
-        textarea.classList.add('save-error');
-        textarea.setAttribute('title', 'Save failed — please try again');
+        showSaveError(draftId);
     }
 }
 
-// Unicode-safe string truncation. Iterates code points (not UTF-16 code units)
-// and stops early once maxLen is reached — O(maxLen) not O(n).
+// Show save error feedback with a retry button so users aren't stuck
+function showSaveError(draftId) {
+    var textarea = document.getElementById('draft-edit-' + draftId);
+    if (!textarea) return;
+
+    textarea.classList.add('save-error');
+    textarea.setAttribute('title', 'Save failed — click Retry or try again');
+
+    // Add a retry button if one doesn't already exist
+    var editBox = textarea.closest('.draft-edit-box');
+    if (!editBox || editBox.querySelector('.save-retry-btn')) return;
+
+    var actionsWrap = editBox.querySelector('.draft-edit-actions');
+    if (!actionsWrap) return;
+
+    var retryBtn = document.createElement('button');
+    retryBtn.className = 'stage-btn save-retry-btn';
+    retryBtn.textContent = 'Retry';
+    retryBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        saveDraftEdit(draftId);
+    });
+    actionsWrap.insertBefore(retryBtn, actionsWrap.firstChild);
+}
+
+// Clear save error state and remove retry button
+function clearSaveError(draftId) {
+    var textarea = document.getElementById('draft-edit-' + draftId);
+    if (textarea) {
+        textarea.classList.remove('save-error');
+        textarea.removeAttribute('title');
+    }
+
+    var editBox = findByDraftId('draft-edit-box', draftId);
+    if (editBox) {
+        var retryBtn = editBox.querySelector('.save-retry-btn');
+        if (retryBtn) retryBtn.remove();
+    }
+}
+
+// Unicode-safe string truncation. Single pass: builds the result incrementally
+// while iterating code points (not UTF-16 code units). O(maxLen).
 function unicodeTruncate(str, maxLen) {
+    var result = '';
     var count = 0;
     for (var ch of str) {
+        if (count >= maxLen) return result;
+        result += ch;
         count++;
-        if (count > maxLen) {
-            // We've passed the limit; rebuild up to maxLen code points
-            var result = '';
-            var i = 0;
-            for (var c of str) {
-                if (i >= maxLen) break;
-                result += c;
-                i++;
-            }
-            return result;
-        }
     }
-    return str; // already within limit
+    return str; // already within limit — return original to avoid allocation
 }
 
 function cancelDraftEdit(draftId) {
     if (!isValidUUID(draftId)) return;
 
-    var escaped = cssEscape(draftId);
-    var editBox = document.querySelector('.draft-edit-box[data-draft-id="' + escaped + '"]');
+    var editBox = findByDraftId('draft-edit-box', draftId);
     if (editBox) editBox.remove();
 
-    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + escaped + '"]');
+    var indicator = findByDraftId('draft-indicator', draftId);
     if (indicator) indicator.classList.remove('hidden');
 }
 

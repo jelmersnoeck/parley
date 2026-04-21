@@ -40,15 +40,19 @@ final class PRViewModel {
     }
 
     /// Updates a draft comment's body. Empty/whitespace-only body removes the draft.
+    /// Truncates to `maxBodyLength` Characters as defense in depth (callers should
+    /// also enforce limits, but the model is the final backstop).
     ///
     /// This is the single source of truth for "empty means delete" logic — callers
     /// (coordinator, inspector panel, JS) should NOT duplicate this check.
     func updateDraftComment(id: UUID, body: String) {
         guard let index = draftComments.firstIndex(where: { $0.id == id }) else { return }
-        if body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed.isEmpty {
+        case true:
             draftComments.remove(at: index)
-        } else {
-            draftComments[index].body = body
+        case false:
+            draftComments[index].body = String(trimmed.prefix(Self.maxBodyLength))
         }
     }
 
