@@ -107,7 +107,16 @@ struct DraftCommentRow: View {
             }
 
             if isEditing {
-                editingView
+                DraftEditView(
+                    editText: $editText,
+                    onSave: {
+                        onSave(editText)
+                        isEditing = false
+                    },
+                    onCancel: {
+                        isEditing = false
+                    }
+                )
             } else {
                 Text(draft.body)
                     .font(.caption)
@@ -120,8 +129,15 @@ struct DraftCommentRow: View {
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
     }
+}
 
-    private var editingView: some View {
+/// Extracted editing UI with length enforcement.
+private struct DraftEditView: View {
+    @Binding var editText: String
+    let onSave: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             TextEditor(text: $editText)
                 .font(.caption)
@@ -130,21 +146,25 @@ struct DraftCommentRow: View {
                 .background(.quaternary)
                 .clipShape(RoundedRectangle(cornerRadius: 4))
                 .onKeyPress(.escape) {
-                    isEditing = false
+                    onCancel()
                     return .handled
+                }
+                .onChange(of: editText) { _, newValue in
+                    if newValue.count > PRViewModel.maxBodyLength {
+                        editText = String(newValue.prefix(PRViewModel.maxBodyLength))
+                    }
                 }
 
             HStack(spacing: 8) {
                 Button("Save") {
-                    onSave(editText)
-                    isEditing = false
+                    onSave()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
                 .controlSize(.small)
 
                 Button("Cancel") {
-                    isEditing = false
+                    onCancel()
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)

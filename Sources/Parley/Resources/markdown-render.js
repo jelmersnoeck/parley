@@ -13,7 +13,11 @@ var tocVisible = true;
 
 // Post message to Swift
 function postToSwift(msg) {
-    window.webkit.messageHandlers.parley.postMessage(msg);
+    try {
+        window.webkit.messageHandlers.parley.postMessage(msg);
+    } catch (err) {
+        console.error('postToSwift failed:', err, 'message:', JSON.stringify(msg));
+    }
 }
 
 // Sanitize HTML to prevent XSS
@@ -639,10 +643,14 @@ function getLineBlockText(startLine, endLine) {
 //  │ [Save]  [Cancel]         │
 //  └──────────────────────────┘
 
-// O(1) draft lookup by ID (rebuilt on each render)
+// O(1) draft lookup by ID (rebuilt when drafts change)
 var draftCommentsById = {};
+var lastDraftFingerprint = '';
 
 function rebuildDraftIndex() {
+    var fingerprint = draftComments.map(function(d) { return d.id; }).join(',');
+    if (fingerprint === lastDraftFingerprint) return;
+    lastDraftFingerprint = fingerprint;
     draftCommentsById = {};
     for (var i = 0; i < draftComments.length; i++) {
         draftCommentsById[draftComments[i].id] = draftComments[i];
@@ -656,21 +664,40 @@ function isValidUUID(str) {
     return typeof str === 'string' && UUID_RE.test(str);
 }
 
+// Escape a string for safe use inside CSS attribute selectors.
+// Even though we UUID-validate, this prevents any selector injection.
+function cssEscape(str) {
+    return str.replace(/["\\]/g, '\\$&');
+}
+
 function findDraftById(draftId) {
     return draftCommentsById[draftId] || null;
 }
 
+// Sanitize body text: strip null bytes for defense-in-depth
+function sanitizeBodyText(str) {
+    return str.replace(/\0/g, '');
+}
+
 function editDraftComment(draftId) {
-    if (!isValidUUID(draftId)) return;
-
-    // Prevent double-click from creating duplicate edit boxes
-    if (document.querySelector('.draft-edit-box[data-draft-id="' + draftId + '"]')) return;
-
-    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + draftId + '"]');
-    if (!indicator) return;
+    if (!isValidUUID(draftId)) {
+        console.warn('editDraftComment: invalid UUID', draftId);
+        return;
+    }
 
     var draft = findDraftById(draftId);
-    if (!draft) return;
+    if (!draft) {
+        console.warn('editDraftComment: draft not found in current context', draftId);
+        return;
+    }
+
+    var escaped = cssEscape(draftId);
+
+    // Prevent double-click from creating duplicate edit boxes
+    if (document.querySelector('.draft-edit-box[data-draft-id="' + escaped + '"]')) return;
+
+    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + escaped + '"]');
+    if (!indicator) return;
 
     indicator.classList.add('hidden');
 
@@ -694,7 +721,7 @@ function createEditBox(draftId, body) {
 
     var textarea = document.createElement('textarea');
     textarea.id = textareaId;
-    textarea.value = body;
+    textarea.value = sanitizeBodyText(body);
     replyBox.appendChild(textarea);
 
     replyBox.appendChild(createEditActions(draftId));
@@ -734,30 +761,34 @@ function saveDraftEdit(draftId) {
     var textarea = document.getElementById('draft-edit-' + draftId);
     if (!textarea) return;
 
-    var body = textarea.value.trim();
-    if (body.length > MAX_BODY_LENGTH) {
-        body = body.substring(0, MAX_BODY_LENGTH);
+    var body = sanitizeBodyText(textarea.value.trim());
+
+    // Unicode-safe truncation: split into code points, not UTF-16 code units
+    if (Array.from(body).length > MAX_BODY_LENGTH) {
+        body = Array.from(body).slice(0, MAX_BODY_LENGTH).join('');
     }
 
-    // Empty body -> remove the draft (consistent with Swift model behavior)
-    if (!body) {
-        removeDraftFromWebView(draftId);
-        return;
-    }
-
+    // Let Swift model be the single source of truth for empty-body-means-delete.
+    // Post editComment for all cases; the coordinator + PRViewModel handle deletion.
     postToSwift({ action: 'editComment', id: draftId, body: body });
 }
 
 function cancelDraftEdit(draftId) {
-    var editBox = document.querySelector('.draft-edit-box[data-draft-id="' + draftId + '"]');
+    if (!isValidUUID(draftId)) return;
+
+    var escaped = cssEscape(draftId);
+    var editBox = document.querySelector('.draft-edit-box[data-draft-id="' + escaped + '"]');
     if (editBox) editBox.remove();
 
-    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + draftId + '"]');
+    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + escaped + '"]');
     if (indicator) indicator.classList.remove('hidden');
 }
 
 function removeDraftFromWebView(draftId) {
-    if (!isValidUUID(draftId)) return;
+    if (!isValidUUID(draftId)) {
+        console.warn('removeDraftFromWebView: invalid UUID', draftId);
+        return;
+    }
     postToSwift({ action: 'removeComment', id: draftId });
 }
 

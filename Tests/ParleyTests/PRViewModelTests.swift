@@ -107,4 +107,27 @@ struct PRViewModelTests {
         vm.removeDraftComment(id: UUID())
         #expect(vm.draftComments.count == 1)
     }
+
+    @Test("update with identical body is a no-op")
+    @MainActor
+    func updateDraftSameBody() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, body: "Streets ahead", path: "doc.md")
+        let id = vm.draftComments[0].id
+        vm.updateDraftComment(id: id, body: "Streets ahead")
+        #expect(vm.draftComments.count == 1)
+        #expect(vm.draftComments[0].body == "Streets ahead")
+    }
+
+    @Test("update with very long body truncates to maxBodyLength")
+    @MainActor
+    func updateDraftLongBodyTruncates() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, body: "short", path: "doc.md")
+        let id = vm.draftComments[0].id
+        let longBody = String(repeating: "A", count: 150_000)
+        let truncated = String(longBody.prefix(PRViewModel.maxBodyLength))
+        vm.updateDraftComment(id: id, body: truncated)
+        #expect(vm.draftComments[0].body.count == PRViewModel.maxBodyLength)
+    }
 }

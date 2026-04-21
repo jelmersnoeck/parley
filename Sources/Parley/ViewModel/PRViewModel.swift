@@ -4,6 +4,9 @@ import SwiftUI
 @Observable
 @MainActor
 final class PRViewModel {
+    /// Maximum allowed length for a draft comment body. Shared with JS via coordinator injection.
+    static let maxBodyLength = 100_000
+
     // MARK: - State
 
     var urlInput: String = ""

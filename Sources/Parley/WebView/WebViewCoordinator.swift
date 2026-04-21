@@ -1,4 +1,5 @@
 import Foundation
+import os
 import WebKit
 
 final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
@@ -7,8 +8,10 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     private var templateLoaded = false
     private var pendingContentLoad = false
 
-    /// Maximum allowed length for a draft comment body from JS input.
-    private static let maxBodyLength = 100_000
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.parley",
+        category: "WebViewCoordinator"
+    )
 
     init(viewModel: PRViewModel) {
         self.viewModel = viewModel
@@ -18,14 +21,20 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any],
-              let action = body["action"] as? String else { return }
+              let action = body["action"] as? String else {
+            Self.logger.warning("Malformed JS message: expected {action: String, ...}, got \(String(describing: message.body))")
+            return
+        }
 
         Task { @MainActor in
             switch action {
             case "addComment":
                 guard let line = body["line"] as? Int,
                       let commentBody = body["body"] as? String,
-                      let validated = Self.validatedBody(commentBody) else { return }
+                      let validated = Self.validatedBody(commentBody) else {
+                    Self.logger.warning("addComment: invalid payload — line or body missing/empty")
+                    return
+                }
                 let startLine = body["startLine"] as? Int
                 let path = viewModel.prMetadata?.markdownFilePath ?? ""
                 viewModel.addDraftComment(line: line, startLine: startLine, body: validated, path: path)
@@ -34,20 +43,29 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             case "submitReply":
                 guard let commentId = body["commentId"] as? Int,
                       let replyBody = body["body"] as? String,
-                      let validated = Self.validatedBody(replyBody) else { return }
+                      let validated = Self.validatedBody(replyBody) else {
+                    Self.logger.warning("submitReply: invalid payload — commentId or body missing/empty")
+                    return
+                }
                 await viewModel.replyToThread(commentId: commentId, body: validated)
 
             case "editComment":
-                guard let idString = body["id"] as? String,
-                      let uuid = UUID(uuidString: idString),
-                      let newBody = body["body"] as? String else { return }
-                let truncated = String(newBody.prefix(Self.maxBodyLength))
-                viewModel.updateDraftComment(id: uuid, body: truncated)
+                guard let uuid = Self.parseUUID(from: body, label: "editComment") else {
+                    return
+                }
+                guard let newBody = body["body"] as? String else {
+                    Self.logger.warning("editComment: missing 'body' field")
+                    return
+                }
+                // Sanitize + truncate, but allow empty (model treats empty as delete)
+                let sanitized = Self.sanitizedBody(newBody)
+                viewModel.updateDraftComment(id: uuid, body: sanitized)
                 reloadContent()
 
             case "removeComment":
-                guard let idString = body["id"] as? String,
-                      let uuid = UUID(uuidString: idString) else { return }
+                guard let uuid = Self.parseUUID(from: body, label: "removeComment") else {
+                    return
+                }
                 viewModel.removeDraftComment(id: uuid)
                 reloadContent()
 
@@ -55,18 +73,40 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
                 break
 
             default:
-                break
+                Self.logger.debug("Unknown JS action: \(action)")
             }
         }
     }
 
     // MARK: - Input validation
 
-    /// Validates and truncates a body string from JS. Returns nil if empty after trimming.
+    /// Extracts and validates a UUID from a message body's "id" field. Logs on failure.
+    private static func parseUUID(from body: [String: Any], label: String) -> UUID? {
+        guard let idString = body["id"] as? String else {
+            logger.warning("\(label): missing 'id' field")
+            return nil
+        }
+        guard let uuid = UUID(uuidString: idString) else {
+            logger.warning("\(label): malformed UUID '\(idString)'")
+            return nil
+        }
+        return uuid
+    }
+
+    /// Sanitizes, trims, and truncates a body string. Returns nil if empty — use for actions
+    /// where empty body is invalid (addComment, submitReply).
     private static func validatedBody(_ raw: String) -> String? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return String(trimmed.prefix(maxBodyLength))
+        let result = sanitizedBody(raw)
+        guard !result.isEmpty else { return nil }
+        return result
+    }
+
+    /// Sanitizes and truncates a body string. Allows empty — use for editComment where
+    /// empty body means "delete" (handled by the model).
+    private static func sanitizedBody(_ raw: String) -> String {
+        let stripped = raw.replacingOccurrences(of: "\0", with: "")
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(trimmed.prefix(PRViewModel.maxBodyLength))
     }
 
     // MARK: - WKNavigationDelegate
@@ -131,7 +171,7 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
         let js = "renderMarkdown(`\(markdown)`, \(threadsJSON), \(draftsJSON));"
         webView.evaluateJavaScript(js) { _, error in
             if let error {
-                print("JS error: \(error)")
+                Self.logger.error("JS render error: \(error)")
             }
         }
     }
