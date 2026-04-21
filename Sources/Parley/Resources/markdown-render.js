@@ -23,14 +23,26 @@ var _parleyConfig = {
 
 // Called by Swift coordinator after template loads to inject config values.
 // Keeps JS constants synchronized without manual duplication.
+// Returns true if at least one valid key was applied, false otherwise.
 function setParleyConfig(config) {
-    if (!config || typeof config !== 'object') return;
+    if (!config || typeof config !== 'object') {
+        console.warn('setParleyConfig: invalid config (not an object)');
+        return false;
+    }
+    var applied = 0;
     for (var key in _parleyConfig) {
         if (config.hasOwnProperty(key) && typeof config[key] === 'number') {
             _parleyConfig[key] = config[key];
+            applied++;
         }
     }
     MAX_BODY_LENGTH = _parleyConfig.maxBodyLength;
+    if (applied === 0) {
+        console.warn('setParleyConfig: config had zero valid keys');
+        return false;
+    }
+    console.log('setParleyConfig: applied ' + applied + ' key(s)');
+    return true;
 }
 
 // ── Error tracking (encapsulated) ──────────────────────────────
@@ -39,62 +51,124 @@ function setParleyConfig(config) {
 var _errorState = {
     postRetries: 0,
     reportFailures: 0,
-    // Serializes postToSwift error handling so one success can't
-    // race-reset the counter while another call is mid-retry.
-    posting: false
+    // Serializes postToSwift error handling so concurrent calls don't
+    // spawn competing retry loops.
+    posting: false,
+    // Messages queued while a post+retry cycle is in flight.
+    pendingMessages: []
+};
+
+// ── Error utilities namespace ──────────────────────────────────
+// Extracted helpers that postToSwift and reportToSwift delegate to.
+// Keeps the retry/backoff/sanitization logic testable and isolated.
+var _errorUtils = {};
+
+// Attempt the actual postMessage call. Returns true on success.
+_errorUtils.tryPost = function(msg) {
+    window.webkit.messageHandlers.parley.postMessage(msg);
+    return true;
+};
+
+// Build a sanitized error message for logging.
+// Only includes known action names; truncates error strings to prevent
+// sensitive WebKit context data from leaking into logs.
+_errorUtils.buildErrorMessage = function(msg, err) {
+    var KNOWN_ACTIONS = ['addComment', 'submitReply', 'editComment', 'removeComment',
+                         'expandThread', 'collapseThread', 'logError'];
+    var rawAction = (msg && typeof msg === 'object') ? String(msg.action || '') : '';
+    var actionName = KNOWN_ACTIONS.indexOf(rawAction) !== -1 ? rawAction : '<redacted>';
+    var rawError = String(err);
+    var safeError = rawError.length > 200 ? rawError.slice(0, 200) + '...' : rawError;
+    return 'postToSwift failed for action "' + actionName + '": ' + safeError;
+};
+
+// Schedule a retry to report the error to Swift via the logError action.
+// Uses exponential backoff (100ms, 200ms, 400ms, ...) and caps at
+// maxRetryAttempts. Each retry attempt is self-contained — it captures
+// the attempt number in the closure to avoid counter interference.
+_errorUtils.scheduleRetry = function(errorMsg, attempt) {
+    if (attempt >= _parleyConfig.maxRetryAttempts) return;
+    var delay = 100 * Math.pow(2, attempt); // 100ms, 200ms, 400ms
+    setTimeout(function() {
+        try {
+            window.webkit.messageHandlers.parley.postMessage({
+                action: 'logError', source: 'postToSwift', detail: errorMsg
+            });
+        } catch (reportErr) {
+            console.error('postToSwift: error reporting also failed (' +
+                (attempt + 1) + '/' + _parleyConfig.maxRetryAttempts + '): ' +
+                String(reportErr).slice(0, 200));
+        }
+    }, delay);
+};
+
+// Safe string slice that won't split surrogate pairs.
+// After slicing, checks if the last char is a lone high surrogate and removes it.
+_errorUtils.safeSlice = function(str, maxLen) {
+    var sliced = str.slice(0, maxLen);
+    if (sliced.length > 0) {
+        var last = sliced.charCodeAt(sliced.length - 1);
+        if (last >= 0xD800 && last <= 0xDBFF) {
+            sliced = sliced.slice(0, -1);
+        }
+    }
+    return sliced;
 };
 
 // Post message to Swift. Errors are bridged back via a dedicated logError action
 // so they surface in os.Logger instead of vanishing into the WebKit console void.
+//
+// Race-condition guard: if a post+retry cycle is already in flight, the message
+// is sent via a plain postMessage without the retry/error-reporting machinery.
+// This prevents concurrent retry loops from interfering with each other's counters.
 //
 // Failure handling: if the error report itself fails, we log to console and stop.
 // A counter caps error-reporting attempts to prevent infinite retry loops (e.g. if
 // the message handler is permanently broken). Retries use exponential backoff
 // via setTimeout to avoid overwhelming the message bridge during transient issues.
 function postToSwift(msg) {
+    // If already in a post+retry cycle, do a plain post to avoid counter interference
+    if (_errorState.posting) {
+        try {
+            _errorUtils.tryPost(msg);
+        } catch (err) {
+            console.error(_errorUtils.buildErrorMessage(msg, err) + ' (skipped retry — already posting)');
+        }
+        return;
+    }
     _errorState.posting = true;
     try {
-        window.webkit.messageHandlers.parley.postMessage(msg);
+        _errorUtils.tryPost(msg);
         _errorState.postRetries = 0;
     } catch (err) {
-        // Sanitize: only include known action names; truncate error to prevent
-        // sensitive WebKit context data from leaking into logs.
-        var KNOWN_ACTIONS = ['addComment', 'submitReply', 'editComment', 'removeComment',
-                             'expandThread', 'collapseThread', 'logError'];
-        var rawAction = (msg && typeof msg === 'object') ? String(msg.action || '') : '';
-        var actionName = KNOWN_ACTIONS.indexOf(rawAction) !== -1 ? rawAction : '<redacted>';
-        var rawError = String(err);
-        var safeError = rawError.length > 200 ? rawError.slice(0, 200) + '...' : rawError;
-        var errorMsg = 'postToSwift failed for action "' + actionName + '": ' + safeError;
+        var errorMsg = _errorUtils.buildErrorMessage(msg, err);
         console.error(errorMsg);
-        // Bridge to Swift logger with exponential backoff
-        if (_errorState.postRetries < _parleyConfig.maxRetryAttempts) {
-            var attempt = _errorState.postRetries;
-            _errorState.postRetries++;
-            var delay = 100 * Math.pow(2, attempt); // 100ms, 200ms, 400ms
-            setTimeout(function() {
-                try {
-                    window.webkit.messageHandlers.parley.postMessage({
-                        action: 'logError', source: 'postToSwift', detail: errorMsg
-                    });
-                } catch (reportErr) {
-                    console.error('postToSwift: error reporting also failed (' +
-                        _errorState.postRetries + '/' + _parleyConfig.maxRetryAttempts + '): ' +
-                        String(reportErr).slice(0, 200));
-                }
-            }, delay);
-        }
+        // Bridge to Swift logger with exponential backoff.
+        // Capture the attempt count so async retries don't share mutable state.
+        var attempt = _errorState.postRetries;
+        _errorState.postRetries++;
+        _errorUtils.scheduleRetry(errorMsg, attempt);
     } finally {
         _errorState.posting = false;
+        // Drain any messages that arrived while we were posting
+        while (_errorState.pendingMessages.length > 0) {
+            var queued = _errorState.pendingMessages.shift();
+            try {
+                _errorUtils.tryPost(queued);
+            } catch (err) {
+                console.error(_errorUtils.buildErrorMessage(queued, err) + ' (queued message)');
+            }
+        }
     }
 }
 
 // Report a warning/error from JS to Swift for proper logging.
 // Failed reports fall back to console.warn (not silently swallowed).
 // Capped at maxReportFailures to prevent unbounded accumulation in long sessions.
+// Logs a final warning when the cap is reached so operators know there's a blind spot.
 function reportToSwift(source, detail) {
     if (_errorState.reportFailures >= _parleyConfig.maxReportFailures) {
-        return; // silently drop — we've already logged plenty of failures
+        return; // cap already reached and logged
     }
     try {
         window.webkit.messageHandlers.parley.postMessage({
@@ -104,7 +178,19 @@ function reportToSwift(source, detail) {
     } catch (err) {
         _errorState.reportFailures++;
         console.warn('[' + source + '] ' + detail + ' (report failed #' + _errorState.reportFailures + ': ' + err + ')');
+        if (_errorState.reportFailures >= _parleyConfig.maxReportFailures) {
+            console.warn('report cap reached, further JS errors will only appear in console');
+        }
     }
+}
+
+// Surface error metrics to the Swift host via evaluateJavaScript.
+function getHealthMetrics() {
+    return {
+        jsErrors: _errorState.postRetries,
+        reportFailures: _errorState.reportFailures,
+        posting: _errorState.posting
+    };
 }
 
 // Sanitize HTML to prevent XSS
@@ -772,6 +858,8 @@ function cssEscape(str) {
     if (typeof str !== 'string') {
         str = String(str);
     }
+    // Length guard BEFORE any processing (including native CSS.escape) to prevent
+    // a malicious long string from reaching any code path.
     if (str.length > _parleyConfig.cssEscapeMaxLength) {
         reportToSwift('cssEscape', 'input too long (' + str.length + '), truncating');
         str = str.slice(0, _parleyConfig.cssEscapeMaxLength);
@@ -779,6 +867,15 @@ function cssEscape(str) {
     if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
         return CSS.escape(str);
     }
+    // Character mapping (per CSSWG serialize-an-identifier):
+    //   U+0000         -> U+FFFD replacement
+    //   U+0001-U+001F  -> \hex + space (C0 controls)
+    //   U+007F         -> \hex + space (DEL)
+    //   First char digit (0x30-0x39) -> \hex + space
+    //   Solo hyphen at position 0 -> \hyphen
+    //   Hyphen + digit at position 0-1 -> \hex + space
+    //   Safe chars (>= 0x80, hyphen, underscore, alphanumeric) -> literal
+    //   Everything else -> \char
     var result = '';
     for (var i = 0; i < str.length; i++) {
         var ch = str.charCodeAt(i);
@@ -1004,29 +1101,27 @@ function clearSaveError(draftId) {
     }
 }
 
-// Unicode-safe string truncation. Single pass: builds the result incrementally
-// while iterating code points (not UTF-16 code units). O(maxLen).
-// Wrapped in try-catch: malformed Unicode sequences (e.g. lone surrogates) can
-// cause the for..of iterator to throw on some engines.
-//
-// Optimization: when the string is already within limit, returns the original
-// reference instead of the incrementally-built copy. This is safe because JS
-// strings are immutable — no aliasing hazard.
+// Unicode-safe string truncation. Fast path: returns immediately if
+// UTF-16 length is within limit (code point count must be too).
+// Slow path: single pass, builds the result incrementally while
+// iterating code points (not UTF-16 code units). O(maxLen).
+// Fallback on iterator failure: safeSlice trims lone high surrogates.
 function unicodeTruncate(str, maxLen) {
+    // Fast path: UTF-16 length within limit means code point count is too.
+    if (str.length <= maxLen) return str;
     try {
         var result = '';
         var count = 0;
         for (var ch of str) {
-            if (count >= maxLen) return result;
+            if (count >= maxLen) break;
             result += ch;
             count++;
         }
-        return str; // already within limit — return original to avoid allocation
+        return result;
     } catch (err) {
-        // Fallback: slice by UTF-16 code units (may split surrogates, but
-        // that's better than losing the entire string).
-        reportToSwift('unicodeTruncate', 'iterator failed, falling back to slice: ' + err);
-        return str.slice(0, maxLen);
+        // Fallback: safe slice trims lone high surrogates to avoid invalid Unicode.
+        reportToSwift('unicodeTruncate', 'iterator failed, falling back to safe slice: ' + err);
+        return _errorUtils.safeSlice(str, maxLen);
     }
 }
 

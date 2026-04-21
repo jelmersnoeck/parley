@@ -148,4 +148,69 @@ struct WebViewCoordinatorTests {
     func maxConsecutiveRenderFailuresPositive() {
         #expect(WebViewCoordinator.maxConsecutiveRenderFailures > 0)
     }
+
+    // MARK: - Nested structs
+
+    @Test("Limits struct exposes expected values")
+    func limitsValues() {
+        #expect(WebViewCoordinator.Limits.maxLineNumber == 1_000_000)
+        #expect(WebViewCoordinator.Limits.maxInputBytes == 1_000_000)
+        #expect(WebViewCoordinator.Limits.maxLogStringLength == 500)
+        #expect(WebViewCoordinator.Limits.maxConsecutiveRenderFailures == 5)
+    }
+
+    @Test("Thresholds struct exposes expected values")
+    func thresholdsValues() {
+        #expect(WebViewCoordinator.Thresholds.errorWarningInterval == 1_000)
+        #expect(WebViewCoordinator.Thresholds.maxErrorWarningThreshold == 1_000_000)
+        #expect(WebViewCoordinator.Thresholds.circuitBreakerCooldown == 30)
+    }
+
+    @Test("backward-compat static accessors delegate to nested structs")
+    func backwardCompatAccessors() {
+        #expect(WebViewCoordinator.maxLineNumber == WebViewCoordinator.Limits.maxLineNumber)
+        #expect(WebViewCoordinator.maxInputBytes == WebViewCoordinator.Limits.maxInputBytes)
+        #expect(WebViewCoordinator.errorWarningInterval == WebViewCoordinator.Thresholds.errorWarningInterval)
+        #expect(WebViewCoordinator.maxConsecutiveRenderFailures == WebViewCoordinator.Limits.maxConsecutiveRenderFailures)
+    }
+
+    // MARK: - HealthMetrics
+
+    @Test("healthMetrics reports initial zeroed state")
+    @MainActor func healthMetricsInitial() {
+        let vm = PRViewModel()
+        let coord = WebViewCoordinator(viewModel: vm)
+        let m = coord.healthMetrics
+        #expect(m.jsErrorCount == 0)
+        #expect(m.validationFailureCount == 0)
+        #expect(m.consecutiveRenderFailures == 0)
+        #expect(m.circuitBreakerOpen == false)
+    }
+
+    // MARK: - DraftBodyEnforcer
+
+    @Test("DraftBodyEnforcer.truncated returns nil for short strings")
+    func enforcerShort() {
+        #expect(DraftBodyEnforcer.truncated("Greendale") == nil)
+    }
+
+    @Test("DraftBodyEnforcer.truncated truncates long strings")
+    func enforcerLong() {
+        let long = String(repeating: "X", count: PRViewModel.maxBodyLength + 100)
+        let result = DraftBodyEnforcer.truncated(long)
+        #expect(result != nil)
+        #expect(result!.count == PRViewModel.maxBodyLength)
+    }
+
+    @Test("DraftBodyEnforcer.enforced passes through short strings")
+    func enforcedShort() {
+        let input = "Human Being mascot"
+        #expect(DraftBodyEnforcer.enforced(input) == input)
+    }
+
+    @Test("DraftBodyEnforcer.enforced clamps long strings")
+    func enforcedLong() {
+        let long = String(repeating: "Z", count: PRViewModel.maxBodyLength + 50)
+        #expect(DraftBodyEnforcer.enforced(long).count == PRViewModel.maxBodyLength)
+    }
 }

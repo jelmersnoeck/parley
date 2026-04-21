@@ -131,6 +131,30 @@ struct DraftCommentRow: View {
     }
 }
 
+// MARK: - Text length enforcement
+
+/// Pure-logic utility for draft body length enforcement.
+/// Separated from DraftEditView so truncation/validation logic is testable
+/// without SwiftUI dependencies.
+enum DraftBodyEnforcer {
+    /// Truncates `value` to `PRViewModel.maxBodyLength` Characters if it exceeds
+    /// the limit. Returns nil when no truncation is needed.
+    ///
+    /// Fast-path: `utf8.count` is O(1) on Swift strings. Since every Character
+    /// encodes to >= 1 UTF-8 byte, `utf8.count >= count`. When UTF-8 length is
+    /// within limit, Character count must be too — skip the O(n) `count` check.
+    static func truncated(_ value: String) -> String? {
+        guard value.utf8.count > PRViewModel.maxBodyLength else { return nil }
+        guard value.count > PRViewModel.maxBodyLength else { return nil }
+        return String(value.prefix(PRViewModel.maxBodyLength))
+    }
+
+    /// Enforces max length on a binding value, returning the clamped string.
+    static func enforced(_ value: String) -> String {
+        truncated(value) ?? value
+    }
+}
+
 /// Extracted editing UI with length enforcement.
 private struct DraftEditView: View {
     @Binding var editText: String
@@ -155,17 +179,19 @@ private struct DraftEditView: View {
                     return .handled
                 }
                 .onChange(of: editText) { _, newValue in
-                    truncateIfNeeded(newValue)
+                    guard let truncated = DraftBodyEnforcer.truncated(newValue) else { return }
+                    truncationToken += 1
+                    editText = truncated
                 }
                 // Belt-and-suspenders: catch paste events that bypass onChange
                 // by re-validating when the editor loses focus.
                 .onSubmit {
-                    enforceMaxLength()
+                    editText = DraftBodyEnforcer.enforced(editText)
                 }
 
             HStack(spacing: 8) {
                 Button("Save") {
-                    enforceMaxLength()
+                    editText = DraftBodyEnforcer.enforced(editText)
                     onSave()
                 }
                 .buttonStyle(.borderedProminent)
@@ -179,36 +205,6 @@ private struct DraftEditView: View {
                 .controlSize(.small)
             }
         }
-    }
-
-    /// Truncates editText if it exceeds maxBodyLength, using a token to
-    /// prevent the resulting onChange echo from re-entering truncation.
-    private func truncateIfNeeded(_ newValue: String) {
-        let expected = truncationToken
-        guard shouldTruncate(newValue) else { return }
-        truncationToken = expected + 1
-        editText = String(newValue.prefix(PRViewModel.maxBodyLength))
-    }
-
-    /// Truncates editText to maxBodyLength if it exceeds the limit.
-    /// Called on save and on submit (focus loss) as defense against paste
-    /// events that may bypass the onChange handler.
-    private func enforceMaxLength() {
-        guard editText.count > PRViewModel.maxBodyLength else { return }
-        editText = String(editText.prefix(PRViewModel.maxBodyLength))
-    }
-
-    /// Checks whether a new value exceeds `maxBodyLength` in Character count.
-    ///
-    /// Fast-path: `utf8.count` is O(1) on Swift strings. Since every Character
-    /// encodes to at least 1 UTF-8 byte, `utf8.count >= count`. When `utf8.count`
-    /// is within limit, Character count must also be within limit — safe to skip
-    /// the expensive O(n) `count`. Multi-byte characters (emoji, CJK) inflate
-    /// `utf8.count` further above `count`, so the only false-positive is
-    /// unnecessarily falling through to the Character check, which is harmless.
-    private func shouldTruncate(_ value: String) -> Bool {
-        guard value.utf8.count > PRViewModel.maxBodyLength else { return false }
-        return value.count > PRViewModel.maxBodyLength
     }
 }
 
