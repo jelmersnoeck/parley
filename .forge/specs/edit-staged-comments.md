@@ -2,6 +2,8 @@
 id: edit-staged-comments
 status: implemented
 ---
+<!-- Post-review hardening applied: input validation, dedup of empty-body logic,
+     O(1) draft lookups, CSS class visibility, extracted helpers. See commit. -->
 # Edit staged draft comments before review submission
 
 ## Description
@@ -15,7 +17,7 @@ draft indicators.
 - `Sources/Parley/ViewModel/PRViewModel.swift` — already has `updateDraftComment(id:body:)` (unused by UI)
 - `Sources/Parley/WebView/WebViewCoordinator.swift` — handles JS→Swift messages; needs new `editComment` action
 - `Sources/Parley/Resources/markdown-render.js` — renders `draft-indicator` divs (read-only today)
-- `Sources/Parley/Resources/styles.css` — draft indicator styles
+- `Sources/Parley/Resources/styles.css` — draft indicator styles; added `.hidden` utility class
 - `Sources/Parley/GitHub/Models.swift` — `DraftComment` struct (unchanged)
 - `Tests/ParleyTests/PRViewModelTests.swift` — existing `updateDraft` test + 4 new tests
 
@@ -49,6 +51,10 @@ draft indicators.
 - Must sanitize edited body text through DOMPurify before DOM insertion (same as all other user content).
 - Must not break existing staging flow (the `+` button and `stageComment` function).
 - Draft IDs passed from JS are UUID strings; the coordinator must parse them with `UUID(uuidString:)`.
+- Empty-body-means-delete logic lives exclusively in `PRViewModel.updateDraftComment` — callers must NOT duplicate this check.
+- JS validates draft IDs match UUID format (`/^[0-9a-f]{8}-…$/i`) before processing.
+- Maximum draft body length enforced on both JS (100,000 chars) and Swift (100,000 chars) sides.
+- DOM visibility toggling uses the `.hidden` CSS class, not inline `style.display`.
 
 ## Interfaces
 
@@ -69,11 +75,8 @@ case "editComment":
     guard let idString = body["id"] as? String,
           let uuid = UUID(uuidString: idString),
           let newBody = body["body"] as? String else { return }
-    if newBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        viewModel.removeDraftComment(id: uuid)
-    } else {
-        viewModel.updateDraftComment(id: uuid, body: newBody)
-    }
+    let truncated = String(newBody.prefix(Self.maxBodyLength))
+    viewModel.updateDraftComment(id: uuid, body: truncated)
     reloadContent()
 
 case "removeComment":
@@ -81,6 +84,19 @@ case "removeComment":
           let uuid = UUID(uuidString: idString) else { return }
     viewModel.removeDraftComment(id: uuid)
     reloadContent()
+```
+
+### Swift model — `updateDraftComment` (single source of truth for empty-body deletion)
+
+```swift
+func updateDraftComment(id: UUID, body: String) {
+    guard let index = draftComments.firstIndex(where: { $0.id == id }) else { return }
+    if body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        draftComments.remove(at: index)
+    } else {
+        draftComments[index].body = body
+    }
+}
 ```
 
 ### SwiftUI inspector — `DraftCommentRow` state
@@ -101,10 +117,15 @@ struct DraftCommentRow: View {
 ### JS functions (new)
 
 ```javascript
-function editDraftComment(draftId)    // swap indicator → edit box
-function saveDraftEdit(draftId)       // post editComment to Swift
-function cancelDraftEdit(draftId)     // restore indicator
-function removeDraftFromWebView(draftId) // post removeComment to Swift
+function editDraftComment(draftId)       // swap indicator -> edit box (validates UUID)
+function saveDraftEdit(draftId)          // post editComment to Swift (validates + truncates body)
+function cancelDraftEdit(draftId)        // restore indicator
+function removeDraftFromWebView(draftId) // post removeComment to Swift (validates UUID)
+function createEditBox(draftId, body)    // builds the edit box DOM subtree
+function createEditActions(draftId)      // builds Save/Cancel button wrap
+function rebuildDraftIndex()             // rebuilds draftCommentsById Map for O(1) lookups
+function isValidUUID(str)                // UUID format validation
+function findDraftById(draftId)          // O(1) lookup via draftCommentsById
 ```
 
 ## Edge Cases
