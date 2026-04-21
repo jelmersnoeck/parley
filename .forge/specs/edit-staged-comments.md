@@ -5,7 +5,10 @@ status: implemented
 <!-- Post-review hardening applied: input validation, dedup of empty-body logic,
      O(1) draft lookups, CSS class visibility, extracted helpers.
      Second review pass: structured logging, null-byte sanitization, CSS selector
-     escaping, Unicode-safe truncation, DraftEditView extraction, test coverage. -->
+     escaping, Unicode-safe truncation, DraftEditView extraction, test coverage.
+     Third review pass: comprehensive CSS.escape(), JS→Swift error bridging,
+     C0/C1 control char stripping, O(maxLen) unicodeTruncate, save error UX,
+     known-action allowlist, jsErrorCount metrics, utf8 fast-path in onChange. -->
 # Edit staged draft comments before review submission
 
 ## Description
@@ -59,8 +62,15 @@ draft indicators.
 - DOM visibility toggling uses the `.hidden` CSS class, not inline `style.display`.
 - `maxBodyLength` is defined once in `PRViewModel` and referenced by coordinator and SwiftUI; JS has its own `MAX_BODY_LENGTH` constant (not yet injected from Swift, but values are synchronized).
 - All coordinator message handlers log warnings on invalid input via `os.Logger`.
-- CSS attribute selectors use `cssEscape()` to prevent selector injection from draft IDs.
-- Body text is sanitized (null bytes stripped) before processing in both JS and Swift.
+- CSS attribute selectors use `CSS.escape()` natively (with comprehensive fallback) to prevent selector injection from draft IDs.
+- Body text is sanitized (null bytes + C0/C1 control chars stripped, preserving tab/newline/CR) before processing in both JS and Swift.
+- JS errors are bridged to Swift via a `logError` message action for production visibility; `console.warn` is not relied upon.
+- The coordinator validates incoming actions against a known-action allowlist before processing.
+- JS `saveDraftEdit` handles postToSwift failures with user-visible feedback (CSS class + title attribute).
+- JS `unicodeTruncate` uses `for..of` iteration for O(maxLen) code-point-aware truncation without `Array.from`.
+- The coordinator tracks `jsErrorCount` for monitoring JS rendering failures.
+- Successful `editComment` and `removeComment` operations are logged at debug level.
+- InspectorPanel `onChange` uses an O(1) `utf8.count` fast-path before the O(n) Character count check.
 - UUID parsing is deduplicated into `parseUUID(from:label:)` helper in the coordinator.
 - JS `saveDraftEdit` delegates empty-body deletion to Swift (no client-side duplication).
 - InspectorPanel enforces `maxBodyLength` via `onChange` truncation in `DraftEditView`.
@@ -128,16 +138,18 @@ struct DraftCommentRow: View {
 
 ```javascript
 function editDraftComment(draftId)       // swap indicator -> edit box (validates UUID + context)
-function saveDraftEdit(draftId)          // post editComment to Swift (validates, sanitizes, Unicode-safe truncation)
+function saveDraftEdit(draftId)          // post editComment to Swift (validates, sanitizes, Unicode-safe truncation, error UX)
 function cancelDraftEdit(draftId)        // restore indicator (UUID-validated, CSS-escaped selectors)
-function removeDraftFromWebView(draftId) // post removeComment to Swift (validates UUID, logs warnings)
+function removeDraftFromWebView(draftId) // post removeComment to Swift (validates UUID, reports to Swift)
 function createEditBox(draftId, body)    // builds the edit box DOM subtree (sanitizes body)
 function createEditActions(draftId)      // builds Save/Cancel button wrap
-function rebuildDraftIndex()             // rebuilds draftCommentsById Map (fingerprint-gated)
+function rebuildDraftIndex()             // rebuilds draftCommentsById Map (fingerprint-gated, null-byte separator)
 function isValidUUID(str)                // UUID format validation
 function findDraftById(draftId)          // O(1) lookup via draftCommentsById
-function cssEscape(str)                  // escapes strings for CSS attribute selectors
-function sanitizeBodyText(str)           // strips null bytes from body text
+function cssEscape(str)                  // CSS.escape() native with comprehensive fallback
+function sanitizeBodyText(str)           // strips C0/C1 control chars from body text
+function unicodeTruncate(str, maxLen)    // O(maxLen) code-point-aware string truncation
+function reportToSwift(source, detail)   // bridges JS warnings/errors to Swift os.Logger
 ```
 
 ## Edge Cases
