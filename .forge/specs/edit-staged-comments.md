@@ -1,6 +1,6 @@
 ---
 id: edit-staged-comments
-status: draft
+status: implemented
 ---
 # Edit staged draft comments before review submission
 
@@ -16,8 +16,8 @@ draft indicators.
 - `Sources/Parley/WebView/WebViewCoordinator.swift` — handles JS→Swift messages; needs new `editComment` action
 - `Sources/Parley/Resources/markdown-render.js` — renders `draft-indicator` divs (read-only today)
 - `Sources/Parley/Resources/styles.css` — draft indicator styles
-- `Sources/Parley/GitHub/Models.swift` — `DraftComment` struct
-- `Tests/ParleyTests/PRViewModelTests.swift` — existing `updateDraft` test
+- `Sources/Parley/GitHub/Models.swift` — `DraftComment` struct (unchanged)
+- `Tests/ParleyTests/PRViewModelTests.swift` — existing `updateDraft` test + 4 new tests
 
 ## Behavior
 
