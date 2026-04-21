@@ -206,6 +206,7 @@ function injectCommentUI() {
         drafts.forEach(function(draft) {
             var draftEl = document.createElement('div');
             draftEl.className = 'draft-indicator';
+            draftEl.setAttribute('data-draft-id', draft.id);
 
             var badge = document.createElement('span');
             badge.className = 'badge';
@@ -213,8 +214,18 @@ function injectCommentUI() {
             draftEl.appendChild(badge);
 
             var bodySpan = document.createElement('span');
+            bodySpan.className = 'draft-body-text';
             bodySpan.textContent = draft.body;
             draftEl.appendChild(bodySpan);
+
+            var editBtn = document.createElement('button');
+            editBtn.className = 'draft-edit-btn';
+            editBtn.textContent = 'Edit';
+            editBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                editDraftComment(draft.id);
+            });
+            draftEl.appendChild(editBtn);
 
             block.appendChild(draftEl);
         });
@@ -484,7 +495,8 @@ function handleSelectionChange() {
     if (findParentWithClass(anchorNode, 'comment-thread') ||
         findParentWithClass(anchorNode, 'reply-box') ||
         findParentWithClass(anchorNode, 'new-comment-box') ||
-        findParentWithClass(anchorNode, 'draft-indicator')) {
+        findParentWithClass(anchorNode, 'draft-indicator') ||
+        findParentWithClass(anchorNode, 'draft-edit-box')) {
         return;
     }
 
@@ -610,11 +622,106 @@ function getLineBlockText(startLine, endLine) {
         if (isNaN(line) || line < startLine || line > endLine) return;
         // Get text without the "+" button text
         var clone = block.cloneNode(true);
-        clone.querySelectorAll('.add-comment-btn, .comment-indicator, .comment-thread, .draft-indicator, .new-comment-box').forEach(function(el) { el.remove(); });
+        clone.querySelectorAll('.add-comment-btn, .comment-indicator, .comment-thread, .draft-indicator, .draft-edit-box, .new-comment-box').forEach(function(el) { el.remove(); });
         var text = clone.textContent.trim();
         if (text) parts.push(text);
     });
     return parts.join('\n');
+}
+
+// ── Draft comment editing ───────────────────────────────────
+//
+//  DRAFT  "body text"  [Edit]    <- indicator (default)
+//  ┌──────────────────────────┐
+//  │ formatting toolbar       │  <- edit box (active)
+//  │ textarea                 │
+//  │ [Save]  [Cancel]         │
+//  └──────────────────────────┘
+
+function editDraftComment(draftId) {
+    // Edge case 6: prevent double-click from creating duplicate edit boxes
+    if (document.querySelector('.draft-edit-box[data-draft-id="' + draftId + '"]')) return;
+
+    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + draftId + '"]');
+    if (!indicator) return;
+
+    // Find the draft body from the stored draftComments array
+    var draft = null;
+    for (var i = 0; i < draftComments.length; i++) {
+        if (draftComments[i].id === draftId) { draft = draftComments[i]; break; }
+    }
+    if (!draft) return;
+
+    // Hide the indicator
+    indicator.style.display = 'none';
+
+    var editBox = document.createElement('div');
+    editBox.className = 'draft-edit-box';
+    editBox.setAttribute('data-draft-id', draftId);
+
+    var textareaId = 'draft-edit-' + draftId;
+    editBox.appendChild(createFormattingToolbar(textareaId));
+
+    var replyBox = document.createElement('div');
+    replyBox.className = 'reply-box';
+
+    var textarea = document.createElement('textarea');
+    textarea.id = textareaId;
+    textarea.value = draft.body;
+    replyBox.appendChild(textarea);
+
+    var btnWrap = document.createElement('div');
+    btnWrap.className = 'draft-edit-actions';
+
+    var saveBtn = document.createElement('button');
+    saveBtn.className = 'stage-btn';
+    saveBtn.textContent = 'Save';
+    saveBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        saveDraftEdit(draftId);
+    });
+    btnWrap.appendChild(saveBtn);
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'draft-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        cancelDraftEdit(draftId);
+    });
+    btnWrap.appendChild(cancelBtn);
+
+    replyBox.appendChild(btnWrap);
+    editBox.appendChild(replyBox);
+
+    indicator.parentNode.insertBefore(editBox, indicator.nextSibling);
+    setTimeout(function() { textarea.focus(); }, 50);
+}
+
+function saveDraftEdit(draftId) {
+    var textarea = document.getElementById('draft-edit-' + draftId);
+    if (!textarea) return;
+
+    var body = textarea.value.trim();
+    // Edge case 2: empty body -> remove the draft
+    if (!body) {
+        removeDraftFromWebView(draftId);
+        return;
+    }
+
+    postToSwift({ action: 'editComment', id: draftId, body: body });
+}
+
+function cancelDraftEdit(draftId) {
+    var editBox = document.querySelector('.draft-edit-box[data-draft-id="' + draftId + '"]');
+    if (editBox) editBox.remove();
+
+    var indicator = document.querySelector('.draft-indicator[data-draft-id="' + draftId + '"]');
+    if (indicator) indicator.style.display = '';
+}
+
+function removeDraftFromWebView(draftId) {
+    postToSwift({ action: 'removeComment', id: draftId });
 }
 
 // Walk up the DOM to find the nearest .line-block ancestor

@@ -32,6 +32,23 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
                       let replyBody = body["body"] as? String else { return }
                 await viewModel.replyToThread(commentId: commentId, body: replyBody)
 
+            case "editComment":
+                guard let idString = body["id"] as? String,
+                      let uuid = UUID(uuidString: idString),
+                      let newBody = body["body"] as? String else { return }
+                if newBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    viewModel.removeDraftComment(id: uuid)
+                } else {
+                    viewModel.updateDraftComment(id: uuid, body: newBody)
+                }
+                reloadContent()
+
+            case "removeComment":
+                guard let idString = body["id"] as? String,
+                      let uuid = UUID(uuidString: idString) else { return }
+                viewModel.removeDraftComment(id: uuid)
+                reloadContent()
+
             case "expandThread", "collapseThread":
                 break
 

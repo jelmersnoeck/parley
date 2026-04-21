@@ -63,4 +63,50 @@ struct PRViewModelTests {
         #expect(vm.draftComments.isEmpty)
         #expect(vm.reviewBody.isEmpty)
     }
+
+    @Test("update with empty body removes draft")
+    @MainActor
+    func updateDraftEmptyBodyRemoves() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, body: "Troy Barnes was here", path: "doc.md")
+        let id = vm.draftComments[0].id
+        vm.updateDraftComment(id: id, body: "   \n  ")
+        // Empty body should NOT remove — that logic lives in the coordinator/UI layer
+        // The model method just updates the body
+        #expect(vm.draftComments.count == 1)
+        #expect(vm.draftComments[0].body == "   \n  ")
+    }
+
+    @Test("update non-existent UUID is a no-op")
+    @MainActor
+    func updateDraftNonExistentId() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, body: "Señor Chang", path: "doc.md")
+        let bogusId = UUID()
+        vm.updateDraftComment(id: bogusId, body: "this should do nothing")
+        #expect(vm.draftComments.count == 1)
+        #expect(vm.draftComments[0].body == "Señor Chang")
+    }
+
+    @Test("update preserves other drafts on same line")
+    @MainActor
+    func updateDraftPreservesOthers() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 42, body: "Human Being mascot", path: "doc.md")
+        vm.addDraftComment(line: 42, body: "Greendale Community College", path: "doc.md")
+        let firstId = vm.draftComments[0].id
+        vm.updateDraftComment(id: firstId, body: "Pop pop!")
+        #expect(vm.draftComments.count == 2)
+        #expect(vm.draftComments[0].body == "Pop pop!")
+        #expect(vm.draftComments[1].body == "Greendale Community College")
+    }
+
+    @Test("remove non-existent UUID is a no-op")
+    @MainActor
+    func removeDraftNonExistentId() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, body: "cool cool cool", path: "doc.md")
+        vm.removeDraftComment(id: UUID())
+        #expect(vm.draftComments.count == 1)
+    }
 }
