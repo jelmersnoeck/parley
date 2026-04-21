@@ -1,6 +1,6 @@
 ---
 id: code-review-hardening-r2
-status: draft
+status: implemented
 ---
 # Second-pass hardening from code review findings
 
@@ -13,45 +13,50 @@ sanitizedBody, and minor naming/documentation improvements.
 ## Context
 - `Sources/Parley/WebView/WebViewCoordinator.swift` — validation metrics, sanitizedBody decomposition, circuit breaker, log sanitization, error count backoff
 - `Sources/Parley/Resources/markdown-render.js` — postToSwift backoff, error type differentiation in saveDraftEdit, rename rebuildDraftIndex, draftId validation, error message sanitization
-- `Sources/Parley/Views/InspectorPanel.swift` — debounce improvement for onChange
-- `Tests/ParleyTests/WebViewCoordinatorTests.swift` — tests for decomposed sanitizedBody helpers
+- `Sources/Parley/Views/InspectorPanel.swift` — debounce improvement for onChange (truncationToken pattern)
+- `Sources/Parley/ViewModel/PRViewModel.swift` — unchanged (pre-existing changes in working tree from prior session)
+- `Tests/ParleyTests/WebViewCoordinatorTests.swift` — 21 tests for decomposed helpers and constants
+- `Tests/ParleyTests/PRViewModelTests.swift` — unchanged (pre-existing)
 
 ## Behavior
 
 ### WebViewCoordinator.swift
-1. Add `validationFailureCount` counter (private(set)) incremented by isValidLine,
-   parseUUID, and sanitizedBody when they detect problems. Logged every
-   `errorWarningInterval` failures.
-2. Decompose `sanitizedBody` into: `truncateOversizedInput(_:)`,
-   `stripControlCharacters(_:)`, and the existing trim+truncate. Each testable
-   independently.
-3. JS render circuit breaker: after `maxConsecutiveRenderFailures` (default 5)
-   consecutive JS eval errors, stop attempting complex renders and log a
-   degraded-mode warning. Reset on successful render.
-4. Sanitize `source` and `detail` from JS logError messages: truncate to 500
-   chars, strip control characters.
-5. `incrementErrorCount` warning frequency uses exponential backoff:
-   warn at 1000, 2000, 4000, 8000, etc. instead of every 1000.
+1. `validationFailureCount` counter incremented by `isValidLine` and `parseUUID`
+   on failure. Logged every `errorWarningInterval` (1000) failures.
+2. `sanitizedBody` decomposed into pipeline: `truncateOversizedInput(_:)` →
+   `stripControlCharacters(_:)` → trim → prefix. Each function is `static`
+   and independently testable.
+3. `sanitizeLogString(_:maxLength:)` truncates to maxLength + "..." and strips
+   control characters. Used for JS logError source/detail fields.
+4. Circuit breaker: `consecutiveRenderFailures` tracks streak. At
+   `maxConsecutiveRenderFailures` (5), `loadContent` skips JS eval and logs
+   warning. Resets to 0 on successful render.
+5. `incrementErrorCount` warning uses exponential backoff via
+   `nextErrorWarningThreshold` (starts at 1000, doubles each time).
+6. `isValidLine` and `parseUUID` changed from `static` to instance methods
+   to access `incrementValidationFailure()`.
 
 ### markdown-render.js
-6. `postToSwift` retry uses exponential backoff: delays of 100ms, 200ms, 400ms
-   before retry attempts (using setTimeout).
-7. `saveDraftEdit` catch block distinguishes error types and shows specific
-   messages: "Network error" vs "Save failed".
-8. Rename `rebuildDraftIndex` to `updateDraftIndex`.
-9. `findByDraftId` validates draftId format (UUID regex) before searching.
-10. Sanitize error messages in postToSwift catch: truncate JS error toString()
-    to 200 chars to prevent sensitive data leakage from WebKit context.
+7. `postToSwift` retry uses exponential backoff via setTimeout: 100ms * 2^attempt.
+   Error toString() truncated to 200 chars before logging.
+8. `saveDraftEdit` catch distinguishes TypeError (bridge unavailable) vs generic
+   error, passes specific user message to `showSaveError(draftId, message)`.
+9. `showSaveError` accepts optional `message` parameter for context-specific
+   tooltip text.
+10. `rebuildDraftIndex` renamed to `updateDraftIndex`.
+11. `findByDraftId` validates draftId with `isValidUUID()` before DOM search.
+12. `unicodeTruncate` comment expanded explaining immutable string optimization.
 
 ### InspectorPanel.swift
-11. Replace isTruncating guard with DispatchQueue.main.async deferral pattern
-    to prevent re-entrant onChange issues more robustly.
+13. `DraftEditView` replaces `isTruncating` boolean guard with `truncationToken`
+    Int counter. Extracted `truncateIfNeeded(_:)` method. Token-based approach
+    is immune to stale boolean state from coalesced SwiftUI events.
 
 ## Constraints
 - No new dependencies.
-- All existing tests must pass.
+- All 50 existing tests pass.
 - No changes to DraftComment struct or PRViewModel public API.
-- Backoff delays in JS must not block the main thread (use setTimeout).
+- Backoff delays in JS use setTimeout (non-blocking).
 
 ## Interfaces
 ```swift
@@ -59,23 +64,28 @@ sanitizedBody, and minor naming/documentation improvements.
 private(set) var validationFailureCount = 0
 private(set) var consecutiveRenderFailures = 0
 static let maxConsecutiveRenderFailures = 5
-
-// Decomposed sanitization
 static func truncateOversizedInput(_ raw: String) -> String
 static func stripControlCharacters(_ input: String) -> String
+static func sanitizeLogString(_ raw: String, maxLength: Int) -> String
 ```
 
 ```javascript
-// Renamed
+// Renamed: rebuildDraftIndex -> updateDraftIndex
 function updateDraftIndex() { ... }
+
+// Updated: showSaveError accepts message
+function showSaveError(draftId, message) { ... }
 ```
 
 ## Edge Cases
-1. Circuit breaker trips after 5 failures, then a successful config injection
-   does NOT reset it (only renderMarkdown success resets it).
-2. Exponential backoff in incrementErrorCount: at Int.max, no further warnings.
+1. Circuit breaker trips after 5 failures; only `loadContent` success resets it.
+   Config injection does NOT reset it.
+2. Exponential backoff in incrementErrorCount: at Int.max nextErrorWarningThreshold,
+   no further warnings emitted.
 3. postToSwift backoff with setTimeout: if page unloads mid-retry, the timeout
    is silently dropped (acceptable).
-4. findByDraftId with non-UUID draftId: logs warning, returns null.
-5. saveDraftEdit network error vs generic error: maps TypeError to network error,
-   everything else to generic.
+4. findByDraftId with non-UUID draftId: reports to Swift, returns null.
+5. saveDraftEdit TypeError → "Connection to app lost" message; other errors →
+   "Save failed" message.
+6. sanitizeLogString on clean short input: passes through unchanged.
+7. truncationToken overflow: Int wraps at 2^63, effectively infinite for UI use.
