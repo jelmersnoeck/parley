@@ -137,8 +137,10 @@ private struct DraftEditView: View {
     let onSave: () -> Void
     let onCancel: () -> Void
 
-    /// Guards against re-entrant onChange during truncation assignment.
-    @State private var isTruncating = false
+    /// Debounce token: incremented on each programmatic truncation to let
+    /// onChange ignore the echo. More robust than a boolean guard — even if
+    /// SwiftUI coalesces or reorders change events, stale tokens are harmless.
+    @State private var truncationToken = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -153,22 +155,7 @@ private struct DraftEditView: View {
                     return .handled
                 }
                 .onChange(of: editText) { _, newValue in
-                    guard !isTruncating else { return }
-                    // Fast-path: utf8.count is O(1) on Swift strings. Since every
-                    // Character encodes to at least 1 UTF-8 byte, utf8.count >= count.
-                    // When utf8.count is within limit, Character count must also be
-                    // within limit — safe to skip the expensive O(n) count. Multi-byte
-                    // characters (emoji, CJK) inflate utf8.count further above count,
-                    // so the only false-positive is unnecessarily falling through to
-                    // the Character check, which is harmless.
-                    guard newValue.utf8.count > PRViewModel.maxBodyLength else { return }
-                    // Only now do the real Character count + truncation.
-                    // String.prefix operates on Character (grapheme cluster) boundaries
-                    // so this never splits multi-byte sequences.
-                    guard newValue.count > PRViewModel.maxBodyLength else { return }
-                    isTruncating = true
-                    editText = String(newValue.prefix(PRViewModel.maxBodyLength))
-                    isTruncating = false
+                    truncateIfNeeded(newValue)
                 }
                 // Belt-and-suspenders: catch paste events that bypass onChange
                 // by re-validating when the editor loses focus.
@@ -194,12 +181,34 @@ private struct DraftEditView: View {
         }
     }
 
+    /// Truncates editText if it exceeds maxBodyLength, using a token to
+    /// prevent the resulting onChange echo from re-entering truncation.
+    private func truncateIfNeeded(_ newValue: String) {
+        let expected = truncationToken
+        guard shouldTruncate(newValue) else { return }
+        truncationToken = expected + 1
+        editText = String(newValue.prefix(PRViewModel.maxBodyLength))
+    }
+
     /// Truncates editText to maxBodyLength if it exceeds the limit.
     /// Called on save and on submit (focus loss) as defense against paste
     /// events that may bypass the onChange handler.
     private func enforceMaxLength() {
         guard editText.count > PRViewModel.maxBodyLength else { return }
         editText = String(editText.prefix(PRViewModel.maxBodyLength))
+    }
+
+    /// Checks whether a new value exceeds `maxBodyLength` in Character count.
+    ///
+    /// Fast-path: `utf8.count` is O(1) on Swift strings. Since every Character
+    /// encodes to at least 1 UTF-8 byte, `utf8.count >= count`. When `utf8.count`
+    /// is within limit, Character count must also be within limit — safe to skip
+    /// the expensive O(n) `count`. Multi-byte characters (emoji, CJK) inflate
+    /// `utf8.count` further above `count`, so the only false-positive is
+    /// unnecessarily falling through to the Character check, which is harmless.
+    private func shouldTruncate(_ value: String) -> Bool {
+        guard value.utf8.count > PRViewModel.maxBodyLength else { return false }
+        return value.count > PRViewModel.maxBodyLength
     }
 }
 

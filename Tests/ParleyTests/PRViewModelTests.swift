@@ -130,4 +130,63 @@ struct PRViewModelTests {
         vm.updateDraftComment(id: id, body: longBody)
         #expect(vm.draftComments[0].body.count == PRViewModel.maxBodyLength)
     }
+
+    // MARK: - Line number validation
+
+    @Test("addDraftComment rejects zero line")
+    @MainActor
+    func addDraftRejectsZeroLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 0, body: "Abed Nadir", path: "doc.md")
+        #expect(vm.draftComments.isEmpty)
+    }
+
+    @Test("addDraftComment rejects negative line")
+    @MainActor
+    func addDraftRejectsNegativeLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: -1, body: "Dean Pelton", path: "doc.md")
+        #expect(vm.draftComments.isEmpty)
+    }
+
+    @Test("addDraftComment rejects line beyond max")
+    @MainActor
+    func addDraftRejectsOverflowLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: WebViewCoordinator.maxLineNumber + 1, body: "Magnitude", path: "doc.md")
+        #expect(vm.draftComments.isEmpty)
+    }
+
+    @Test("addDraftComment accepts line at max boundary")
+    @MainActor
+    func addDraftAcceptsMaxLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: WebViewCoordinator.maxLineNumber, body: "Pop pop!", path: "doc.md")
+        #expect(vm.draftComments.count == 1)
+    }
+
+    @Test("addDraftComment rejects startLine greater than line")
+    @MainActor
+    func addDraftRejectsStartLineAfterLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, startLine: 20, body: "Britta Perry", path: "doc.md")
+        #expect(vm.draftComments.isEmpty)
+    }
+
+    @Test("addDraftComment rejects zero startLine")
+    @MainActor
+    func addDraftRejectsZeroStartLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, startLine: 0, body: "Jeff Winger", path: "doc.md")
+        #expect(vm.draftComments.isEmpty)
+    }
+
+    @Test("addDraftComment accepts valid startLine")
+    @MainActor
+    func addDraftAcceptsValidStartLine() {
+        let vm = PRViewModel()
+        vm.addDraftComment(line: 10, startLine: 5, body: "Annie Edison", path: "doc.md")
+        #expect(vm.draftComments.count == 1)
+        #expect(vm.draftComments[0].startLine == 5)
+    }
 }

@@ -11,54 +11,99 @@ var draftComments = [];
 var expandedThreads = {};
 var tocVisible = true;
 
+// ── Configuration ───────────────────────────────────────────────
+// Injected from Swift via setParleyConfig() to maintain a single source of truth.
+// Defaults mirror the Swift-side values; injection overwrites them at load time.
+var _parleyConfig = {
+    maxBodyLength: 100000,      // PRViewModel.maxBodyLength
+    maxRetryAttempts: 3,        // postToSwift error-report retry cap
+    maxReportFailures: 50,      // reportToSwift failure cap before giving up
+    cssEscapeMaxLength: 100000  // DoS guard for cssEscape fallback
+};
+
+// Called by Swift coordinator after template loads to inject config values.
+// Keeps JS constants synchronized without manual duplication.
+function setParleyConfig(config) {
+    if (!config || typeof config !== 'object') return;
+    for (var key in _parleyConfig) {
+        if (config.hasOwnProperty(key) && typeof config[key] === 'number') {
+            _parleyConfig[key] = config[key];
+        }
+    }
+    MAX_BODY_LENGTH = _parleyConfig.maxBodyLength;
+}
+
+// ── Error tracking (encapsulated) ──────────────────────────────
+// Avoids polluting the global scope; counters are capped to prevent
+// unbounded accumulation in long sessions.
+var _errorState = {
+    postRetries: 0,
+    reportFailures: 0,
+    // Serializes postToSwift error handling so one success can't
+    // race-reset the counter while another call is mid-retry.
+    posting: false
+};
+
 // Post message to Swift. Errors are bridged back via a dedicated logError action
 // so they surface in os.Logger instead of vanishing into the WebKit console void.
 //
 // Failure handling: if the error report itself fails, we log to console and stop.
 // A counter caps error-reporting attempts to prevent infinite retry loops (e.g. if
-// the message handler is permanently broken).
-var _postToSwiftErrorAttempts = 0;
-var _postToSwiftMaxAttempts = 3;
-
+// the message handler is permanently broken). Retries use exponential backoff
+// via setTimeout to avoid overwhelming the message bridge during transient issues.
 function postToSwift(msg) {
+    _errorState.posting = true;
     try {
         window.webkit.messageHandlers.parley.postMessage(msg);
-        _postToSwiftErrorAttempts = 0; // reset on success
+        _errorState.postRetries = 0;
     } catch (err) {
-        // Avoid leaking user data in error logs — only include the action name
-        var actionName = (msg && typeof msg === 'object') ? String(msg.action || 'unknown') : 'unknown';
-        var errorMsg = 'postToSwift failed for action "' + actionName + '": ' + String(err);
+        // Sanitize: only include known action names; truncate error to prevent
+        // sensitive WebKit context data from leaking into logs.
+        var KNOWN_ACTIONS = ['addComment', 'submitReply', 'editComment', 'removeComment',
+                             'expandThread', 'collapseThread', 'logError'];
+        var rawAction = (msg && typeof msg === 'object') ? String(msg.action || '') : '';
+        var actionName = KNOWN_ACTIONS.indexOf(rawAction) !== -1 ? rawAction : '<redacted>';
+        var rawError = String(err);
+        var safeError = rawError.length > 200 ? rawError.slice(0, 200) + '...' : rawError;
+        var errorMsg = 'postToSwift failed for action "' + actionName + '": ' + safeError;
         console.error(errorMsg);
-        // Bridge to Swift logger — capped attempts prevent infinite retry loops
-        if (_postToSwiftErrorAttempts < _postToSwiftMaxAttempts) {
-            _postToSwiftErrorAttempts++;
-            try {
-                window.webkit.messageHandlers.parley.postMessage({
-                    action: 'logError', source: 'postToSwift', detail: errorMsg
-                });
-            } catch (reportErr) {
-                // Error reporting itself failed — log to console as last resort
-                console.error('postToSwift: error reporting also failed (' +
-                    _postToSwiftErrorAttempts + '/' + _postToSwiftMaxAttempts + '): ' +
-                    String(reportErr));
-            }
+        // Bridge to Swift logger with exponential backoff
+        if (_errorState.postRetries < _parleyConfig.maxRetryAttempts) {
+            var attempt = _errorState.postRetries;
+            _errorState.postRetries++;
+            var delay = 100 * Math.pow(2, attempt); // 100ms, 200ms, 400ms
+            setTimeout(function() {
+                try {
+                    window.webkit.messageHandlers.parley.postMessage({
+                        action: 'logError', source: 'postToSwift', detail: errorMsg
+                    });
+                } catch (reportErr) {
+                    console.error('postToSwift: error reporting also failed (' +
+                        _errorState.postRetries + '/' + _parleyConfig.maxRetryAttempts + '): ' +
+                        String(reportErr).slice(0, 200));
+                }
+            }, delay);
         }
+    } finally {
+        _errorState.posting = false;
     }
 }
 
 // Report a warning/error from JS to Swift for proper logging.
 // Failed reports fall back to console.warn (not silently swallowed).
-var _reportFailCount = 0;
-
+// Capped at maxReportFailures to prevent unbounded accumulation in long sessions.
 function reportToSwift(source, detail) {
+    if (_errorState.reportFailures >= _parleyConfig.maxReportFailures) {
+        return; // silently drop — we've already logged plenty of failures
+    }
     try {
         window.webkit.messageHandlers.parley.postMessage({
             action: 'logError', source: source, detail: String(detail)
         });
-        _reportFailCount = 0;
+        _errorState.reportFailures = 0;
     } catch (err) {
-        _reportFailCount++;
-        console.warn('[' + source + '] ' + detail + ' (report failed #' + _reportFailCount + ': ' + err + ')');
+        _errorState.reportFailures++;
+        console.warn('[' + source + '] ' + detail + ' (report failed #' + _errorState.reportFailures + ': ' + err + ')');
     }
 }
 
@@ -71,7 +116,7 @@ function sanitize(html) {
 function renderMarkdown(markdown, threads, drafts) {
     commentThreads = threads || [];
     draftComments = drafts || [];
-    rebuildDraftIndex();
+    updateDraftIndex();
 
     // Strip and render frontmatter
     var content = markdown;
@@ -689,7 +734,7 @@ function getLineBlockText(startLine, endLine) {
 var draftCommentsById = {};
 var lastDraftFingerprint = '';
 
-function rebuildDraftIndex() {
+function updateDraftIndex() {
     // Pipe separator: can't appear in UUIDs, avoids null-byte collision risk
     var fingerprint = draftComments.map(function(d) { return d.id; }).join('|');
     if (fingerprint === lastDraftFingerprint) return;
@@ -701,7 +746,8 @@ function rebuildDraftIndex() {
 }
 
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-var MAX_BODY_LENGTH = 100000;
+// Initialized from _parleyConfig; updated by setParleyConfig() injection.
+var MAX_BODY_LENGTH = _parleyConfig.maxBodyLength;
 
 function isValidUUID(str) {
     return typeof str === 'string' && UUID_RE.test(str);
@@ -723,6 +769,13 @@ function isValidUUID(str) {
 //   U+0080+           -> pass through        (safe ident chars)
 //   Everything else   -> backslash escape    (punctuation, symbols, etc.)
 function cssEscape(str) {
+    if (typeof str !== 'string') {
+        str = String(str);
+    }
+    if (str.length > _parleyConfig.cssEscapeMaxLength) {
+        reportToSwift('cssEscape', 'input too long (' + str.length + '), truncating');
+        str = str.slice(0, _parleyConfig.cssEscapeMaxLength);
+    }
     if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
         return CSS.escape(str);
     }
@@ -773,12 +826,12 @@ function findDraftById(draftId) {
 //   0x0B-0x1F  C0 control chars after newline (includes CR 0x0D)
 //   0x7F-0x9F  DEL + C1 control chars
 // CR (0x0D) is stripped — unnecessary in markdown, potential injection vector.
-// Logs to Swift when sanitization strips characters, for monitoring.
+// Reports to Swift only that sanitization occurred (not the count, to prevent
+// an attacker from using log volume to infer filtered content).
 function sanitizeBodyText(str) {
     var cleaned = str.replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/g, '');
     if (cleaned.length !== str.length) {
-        var strippedCount = str.length - cleaned.length;
-        reportToSwift('sanitizeBodyText', 'stripped ' + strippedCount + ' control character(s) from input');
+        reportToSwift('sanitizeBodyText', 'stripped control characters from input');
     }
     return cleaned;
 }
@@ -786,7 +839,12 @@ function sanitizeBodyText(str) {
 // Find a DOM element by class name and data-draft-id using dataset comparison.
 // Avoids CSS selector construction (and cssEscape edge cases) by comparing
 // the raw dataset.draftId property via strict equality.
+// Validates draftId format before searching to reject malformed input early.
 function findByDraftId(className, draftId) {
+    if (!isValidUUID(draftId)) {
+        reportToSwift('findByDraftId', 'invalid draftId format');
+        return null;
+    }
     var candidates = document.querySelectorAll('.' + className);
     for (var i = 0; i < candidates.length; i++) {
         if (candidates[i].dataset.draftId === draftId) return candidates[i];
@@ -884,26 +942,35 @@ function saveDraftEdit(draftId) {
     // code units) with early termination — no O(n) Array.from allocation.
     body = unicodeTruncate(body, MAX_BODY_LENGTH);
 
-    // Clear any stale error state from a previous failed save
-    clearSaveError(draftId);
-
     // Let Swift model be the single source of truth for empty-body-means-delete.
     // Post editComment for all cases; the coordinator + PRViewModel handle deletion.
     try {
         postToSwift({ action: 'editComment', id: draftId, body: body });
+        // Clear error state only after successful post — avoids clearing stale errors
+        // if postToSwift throws synchronously before the message is sent.
+        clearSaveError(draftId);
     } catch (err) {
-        reportToSwift('saveDraftEdit', 'failed to save draft ' + draftId + ': ' + err);
-        showSaveError(draftId);
+        // Distinguish error types so users get actionable messages:
+        // TypeError typically indicates the message bridge is unavailable (network-ish),
+        // everything else is a generic save failure.
+        var isNetworkish = err instanceof TypeError;
+        var userMsg = isNetworkish
+            ? 'Connection to app lost — click Retry'
+            : 'Save failed — click Retry or try again';
+        reportToSwift('saveDraftEdit', 'failed to save draft ' + draftId + ' (' +
+            (isNetworkish ? 'bridge' : 'other') + '): ' + String(err).slice(0, 200));
+        showSaveError(draftId, userMsg);
     }
 }
 
-// Show save error feedback with a retry button so users aren't stuck
-function showSaveError(draftId) {
+// Show save error feedback with a retry button so users aren't stuck.
+// `message` provides context-specific guidance (network vs generic failure).
+function showSaveError(draftId, message) {
     var textarea = document.getElementById('draft-edit-' + draftId);
     if (!textarea) return;
 
     textarea.classList.add('save-error');
-    textarea.setAttribute('title', 'Save failed — click Retry or try again');
+    textarea.setAttribute('title', message || 'Save failed — click Retry or try again');
 
     // Add a retry button if one doesn't already exist
     var editBox = textarea.closest('.draft-edit-box');
@@ -939,15 +1006,28 @@ function clearSaveError(draftId) {
 
 // Unicode-safe string truncation. Single pass: builds the result incrementally
 // while iterating code points (not UTF-16 code units). O(maxLen).
+// Wrapped in try-catch: malformed Unicode sequences (e.g. lone surrogates) can
+// cause the for..of iterator to throw on some engines.
+//
+// Optimization: when the string is already within limit, returns the original
+// reference instead of the incrementally-built copy. This is safe because JS
+// strings are immutable — no aliasing hazard.
 function unicodeTruncate(str, maxLen) {
-    var result = '';
-    var count = 0;
-    for (var ch of str) {
-        if (count >= maxLen) return result;
-        result += ch;
-        count++;
+    try {
+        var result = '';
+        var count = 0;
+        for (var ch of str) {
+            if (count >= maxLen) return result;
+            result += ch;
+            count++;
+        }
+        return str; // already within limit — return original to avoid allocation
+    } catch (err) {
+        // Fallback: slice by UTF-16 code units (may split surrogates, but
+        // that's better than losing the entire string).
+        reportToSwift('unicodeTruncate', 'iterator failed, falling back to slice: ' + err);
+        return str.slice(0, maxLen);
     }
-    return str; // already within limit — return original to avoid allocation
 }
 
 function cancelDraftEdit(draftId) {

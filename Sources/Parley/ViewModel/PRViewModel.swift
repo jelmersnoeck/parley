@@ -30,7 +30,14 @@ final class PRViewModel {
 
     // MARK: - Draft management
 
+    /// Adds a draft comment at the given line. Validates that `line` is positive
+    /// and within `WebViewCoordinator.maxLineNumber` to prevent logic bugs from
+    /// user-controlled data flowing through unchecked.
     func addDraftComment(line: Int, startLine: Int? = nil, body: String, path: String) {
+        guard line > 0, line <= WebViewCoordinator.maxLineNumber else { return }
+        if let sl = startLine {
+            guard sl > 0, sl <= WebViewCoordinator.maxLineNumber, sl <= line else { return }
+        }
         let draft = DraftComment(line: line, startLine: startLine, body: body, path: path)
         draftComments.append(draft)
     }
